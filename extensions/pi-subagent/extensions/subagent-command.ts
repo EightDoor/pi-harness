@@ -19,6 +19,8 @@ export interface DirectTask {
 	name: string;
 	status: string;
 	canClose?: boolean;
+	/** Entry IDs of running workers in a locally owned all-read workflow; each can be stopped alone. */
+	stoppable?: readonly string[];
 	recovery?: string;
 	/** Recorded workers by original index; empty for legacy records. */
 	workers: readonly DirectDisplay[];
@@ -52,8 +54,11 @@ export interface IsolatedInventory {
 export interface SubagentCommandAdapter {
 	direct(ctx: ExtensionContext): readonly DirectTask[];
 	closeDirect(task: DirectTask, current: () => boolean): Promise<string>;
+	stopDirect(task: DirectTask, entryId: string, current: () => boolean): Promise<string>;
 	isolated(cwd: string, current: () => boolean): Promise<IsolatedInventory>;
 	recover(cwd: string): Promise<string>;
+	/** Read-only Role catalog report with routes and per-file load errors. */
+	roles(ctx: ExtensionContext): string;
 	inspectInTab(root: string, requestId: string, ctx: ExtensionContext, current: () => boolean): Promise<{ ref: string; tabId: string; name: string; sessionFile: string }>;
 	canFollowup(root: string, requestId: string, taskId: string): boolean;
 	enqueue(root: string, requestId: string, taskId: string, text: string, current: () => boolean): string;
@@ -63,6 +68,7 @@ export interface SubagentCommandAdapter {
 }
 
 const clean = (text: string, max = 110, multiline = false): string => [...text.replace(multiline ? /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g : /[\u0000-\u001f\u007f-\u009f]/g, " ")].slice(0, max).join("");
+const ROLES_REPORT_CODE_POINTS = 16_000;
 const errorText = (error: unknown): string => clean(error instanceof Error ? error.message : String(error), 500);
 const completed = (status: string) => ["completed", "success", "failed", "failure", "aborted", "integrated"].includes(status);
 const priority = (status: string) => /attention|blocked|retained|failed/i.test(status) ? 0 : completed(status) ? 2 : 1;
@@ -78,10 +84,16 @@ async function choose<T>(ctx: ExtensionContext, title: string, items: readonly C
 
 export function registerSubagentCommand(pi: ExtensionAPI, adapter: SubagentCommandAdapter): void {
 	pi.registerCommand("subagent", {
-		description: "Inspect direct and isolated work, or recover orphaned isolated requests with /subagent recover",
+		description: "Inspect direct and isolated work, list Roles with /subagent roles, or recover orphaned isolated requests with /subagent recover",
 		handler: async (args, ctx) => {
 			const command = args.trim();
-			if (command && command !== "recover") throw new Error("Usage: /subagent [recover]");
+			if (command && command !== "recover" && command !== "roles") throw new Error("Usage: /subagent [recover|roles]");
+			if (command === "roles") {
+				const report = clean(adapter.roles(ctx), ROLES_REPORT_CODE_POINTS, true);
+				if (ctx.hasUI) ctx.ui.notify(report, "info");
+				else pi.sendMessage({ customType: "pi-subagent-roles", content: report, display: true });
+				return;
+			}
 			if (!command && !ctx.hasUI) throw new Error("/subagent requires interactive UI (TUI or RPC); use the subagent agent tools in non-interactive mode.");
 			const manager = ctx.sessionManager;
 			const session = manager.getSessionId();
@@ -151,13 +163,21 @@ export function registerSubagentCommand(pi: ExtensionAPI, adapter: SubagentComma
 					const untabbed = task.workers.filter((worker) => !task.tabs.some((tab) => tab.display?.worker === worker.worker));
 					for (const worker of untabbed) ctx.ui.notify(`${clean(workerLabel(worker))} · no verified tab recorded`, "info");
 					if (task.workers[0] && task.workers.length < task.workers[0].workers) ctx.ui.notify(`${task.workers[0].workers - task.workers.length} other worker(s) in D${task.workers[0].workflow} have no recorded tab.`, "info");
-					if (task.canClose) {
-						const action = await choose(ctx, `Direct · ${label}`, [
-							{ label: "Close/cancel-and-release ALL owned workers in this workflow (preserve files and commits)", value: "close" },
-							{ label: "Back / refresh", value: "back" },
+					const stoppable = task.tabs.filter((tab) => task.stoppable?.includes(tab.entryId));
+					if (task.canClose || stoppable.length) {
+						const action = await choose<{ kind: "close" | "back" } | { kind: "stop"; entryId: string }>(ctx, `Direct · ${label}`, [
+							...(task.canClose ? [{ label: "Close/cancel-and-release ALL owned workers in this workflow (preserve files and commits)", value: { kind: "close" as const } }] : []),
+							...stoppable.map((tab) => ({ label: `Stop this worker: ${tab.display ? workerLabel(tab.display) : tab.name} (other workers continue)`, value: { kind: "stop" as const, entryId: tab.entryId } })),
+							{ label: "Back / refresh", value: { kind: "back" as const } },
 						]);
 						if (!valid()) return;
-						if (action === "close") {
+						if (action?.kind === "stop") {
+							try {
+								const report = await adapter.stopDirect(task, action.entryId, current);
+								if (valid()) ctx.ui.notify(report, "info");
+							} catch (error) { if (valid()) ctx.ui.notify(`Worker stop failed: ${errorText(error)}. Inspect the exact tab/session before retrying.`, "error"); }
+						}
+						if (action?.kind === "close") {
 							try {
 								const report = await adapter.closeDirect(task, current);
 								if (valid()) ctx.ui.notify(report, "info");

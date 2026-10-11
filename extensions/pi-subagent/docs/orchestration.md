@@ -20,6 +20,7 @@ Direct mode selects one single, parallel, or chain workflow:
   "role": "scout",
   "name": "Inspect auth flow",
   "task": "Return the relevant files and risks.",
+  "access": "read",
   "kind": "text",
   "modelClass": "fast"
 }
@@ -29,8 +30,8 @@ Direct mode selects one single, parallel, or chain workflow:
 {
   "mode": "direct",
   "tasks": [
-    { "role": "scout", "name": "Inspect service", "task": "Inspect the service boundary." },
-    { "role": "reviewer", "name": "Inspect tests", "task": "Inspect the test contract." }
+    { "role": "scout", "name": "Inspect service", "task": "Inspect the service boundary.", "access": "read" },
+    { "role": "reviewer", "name": "Inspect tests", "task": "Inspect the test contract.", "access": "read" }
   ]
 }
 ```
@@ -39,8 +40,8 @@ Direct mode selects one single, parallel, or chain workflow:
 {
   "mode": "direct",
   "chain": [
-    { "role": "scout", "name": "Collect evidence", "task": "Collect exact evidence." },
-    { "role": "reviewer", "name": "Review evidence", "task": "Review this report:\n{previous}" }
+    { "role": "scout", "name": "Collect evidence", "task": "Collect exact evidence.", "access": "read" },
+    { "role": "reviewer", "name": "Review evidence", "task": "Review this report:\n{previous}", "access": "read" }
   ]
 }
 ```
@@ -56,21 +57,27 @@ Each entry has:
 | `role` | yes | Effective configured Role name |
 | `name` | yes | Short display name without terminal controls |
 | `task` | yes | Non-empty task packet |
+| `access` | yes | `read` or `write`; Main's honest classification, not enforced |
+| `continueFrom` | no | Direct reference such as `D7.1`; continues that finished worker's Pi session. `role` must equal the recorded Role |
 | `kind` | no | `text` only (default); direct `changeset` is rejected |
 | `modelClass` | no | `fast`, `balanced`, `frontier`, or `fav` route |
 | `model` | no | `provider/modelId`; replaces only the route model |
 
 An explicit model must support the route's thinking level. A launched child is never retried automatically after provider or process failure.
 
-Direct tasks use their Role's declared resources, including write tools, within explicit task authorization. Read-only Role restrictions, resource/trust validation, and recursive-delegation exclusions still apply. A direct `changeset` is rejected; use isolated mode for checked integration. Tasks in any potential-writer request run serially and reserve checkout admission until exact successful completion; pure read-only parallel tasks run concurrently. Results stay in request order. A chain substitutes only the preceding successful output and stops at its first failure.
+Direct tasks use their Role's declared resources, including write tools, within explicit task authorization. Resource/trust validation and recursive-delegation exclusions still apply. A direct `changeset` is rejected; use isolated mode for checked integration. Roles do not classify writes: a request is a write request when any task declares `access: "write"`. Write requests run serially and reserve checkout admission until owned workers are proved stopped. Read requests skip admission and return plain text; their parallel `tasks` run concurrently up to `maxSubagents`, while a chain stays ordered; `read` is not enforced. Results stay in request order. A chain substitutes only the preceding successful output and stops at its first failure.
 
 The internal `git_read` tool is read-only and loads only when declared in the Role's `tools`; the built-in reviewer includes it. Supply named refs and paths for bounded local Git evidence without Bash. User reviewer overrides must opt in explicitly. Exact isolated review keeps the supplied patch authoritative; named-ref inspection may supply only referenced context, never another branch or worktree's candidate diff. Reviewers still run no tests or mutations and approve with exactly `PASS`.
 
-Writes and commits immediately change the shared checkout; there is no automatic validation, rollback, or isolated promotion. A potential-writer final answer must be a JSON object with `outcome` (`succeeded`, `failed`, or `blocked`) and a non-empty `answer`; only explicit worker-reported success permits later dispatch or admission release, not merely a normally settled Pi turn. Preserve unrelated files and index entries, require explicit commit/external-action scope, and report checkout status. Uncertain launch after tab creation, failure, or cancellation retains admission and exact recovery identities. Inspect `/subagent`, stop remaining owned workers, inspect and preserve changes, then restart Pi before new writes. Admission covers this Main's Pi calls, not other sessions or external processes.
+Writes and commits immediately change the shared checkout; there is no automatic validation, rollback, or isolated promotion. A final answer in a write request must be a JSON object with `outcome` (`succeeded`, `failed`, or `blocked`) and a non-empty `answer`; only explicit worker-reported success permits later dispatch or admission release, not merely a normally settled Pi turn. Preserve unrelated files and index entries, require explicit commit/external-action scope, and report checkout status. Uncertain launch after tab creation, failure, or cancellation retains admission and exact recovery identities. Inspect `/subagent`, stop remaining owned workers, inspect and preserve changes, then restart Pi before new writes. Admission covers this Main's Pi calls, not other sessions or external processes.
 
 The tool returns a handle after the first exact Herdr tab is launched. The remaining tabs are launched asynchronously; their identities are recorded on the session branch. A session-owned observer awaits each exact agent's lifecycle and retrieves its final answer from its Pi session file, not its possibly truncated screen. Idle, blocked, unknown, malformed, or oversized answers fail with recoverable tab/session identity; no whole-run deadline is imposed. `/subagent` shows exact recorded tabs on this session branch, distinguishing locally observed work from unobserved records. A session switch stops observation and carries tab identity into the new branch.
 
-The result is delivered to Main with `triggerTurn: true, deliverAs: "followUp"`. Busy Main finishes its current turn before consuming the result; idle Main starts a turn. Herdr reports worker lifecycle but never prompts Main directly. Read-only workers can observe a concurrently changing checkout; consumers must account for drift rather than treating a tab as file isolation.
+`continueFrom` resolves to exactly one recorded tab on the current session branch; an unknown or ambiguous reference, a different Role, or a second continuation of the same worker in one request fails before launch. The request also fails before launch while a locally active task owns the worker's session, when the session file is missing or above 16 MiB, or when its last exact turn for the recorded prompt is not terminal. Records without a saved turn identity (written before 27.0.0) are not continuable. Each record saves its Herdr workspace and checkout; a record from another workspace or checkout is refused. A session continued again has a later user turn, so only its newest reference is continuable. A still-listed old agent must match the exact recorded identity and be idle or done; it is closed with the same proof as termination (pane absence and two empty lease scans), and an absent agent still needs the two empty scans. The worker then starts in a new non-focused tab with Pi `--session` on the same file and the same private lease, a new agent name, and a new reference and record. Its answer is matched by the new prompt's turn identity. Access, admission, write rules, and route precedence are the same as for a new task; the handle and result name the source reference.
+
+In `/subagent`, a locally owned active workflow whose tasks are all `read` offers **Stop this worker** for each running worker. Each entry has its own abort controller linked to the workflow controller. Stop aborts only that entry, sends Ctrl-C, and proves termination with the exact pane close, pane absence, and two empty lease scans. The entry fails with `Stopped by user from /subagent` and keeps partial output; siblings continue, a chain stops later steps, and Main still receives one result. Write workflows offer only all-or-nothing Close. Stop uses the same session, branch, epoch, and ownership guards as Close. If a stop proof fails, the workflow keeps local ownership after its siblings settle, so Close can retry termination.
+
+The result is delivered to Main with `triggerTurn: true, deliverAs: "followUp"`. Busy Main finishes its current turn before consuming the result; idle Main starts a turn. Herdr reports worker lifecycle but never prompts Main directly. Read-access workers can observe a concurrently changing checkout; consumers must account for drift rather than treating a tab as file isolation.
 
 ## Isolated contract
 
@@ -181,7 +188,7 @@ The package exports:
 
 | API | Responsibility |
 | --- | --- |
-| `loadRoles` | Load built-in and user Role Markdown with strict validation |
+| `loadRoleCatalog` / `findRole` | Load built-in and user Roles with `roleDefaults` and per-file errors; select one by name |
 | `parseRoleName` | Normalize arbitrary Role names and reject display controls |
 | `resolveRoleSkills` | Resolve named Skills from Pi's effective registry |
 | `resolveRoleLaunch` | Resolve Role, caller-owned Model Task, resources, and route |
