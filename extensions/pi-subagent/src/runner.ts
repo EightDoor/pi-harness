@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import type { EphemeralSubagentExecutor } from "./ephemeral.ts";
 import { createChildWorktree, finalizeChildWorktree, inspectWorktreeDirty, type WorktreeInfo } from "./worktree.ts";
+import type { PruneOwnership } from "./prune.ts";
 import { runGit } from "./git-process.ts";
 import { IntegrationGit, type StageReceipt } from "./integration-git.ts";
 import {
@@ -49,8 +50,11 @@ import { FileRunStore, ProductiveRunLeaseBusyError, type ProductiveRunLease, typ
 const TRUNCATION_MARKER = "\n[truncated]";
 const TEXT_TASK_PROMPT_MAX_BYTES = 64 * 1024;
 const CHANGESET_TASK_PROMPT_MAX_BYTES = 96 * 1024;
+const CORRECTION_DELIVERY_RESERVE_BYTES = 1024;
 const MAX_WORKER_PROMPTS = 32;
 const MAX_QUEUED_FOLLOWUPS = 16;
+/** One durable follow-up per attempt; the runner itself never commits, stages, stashes, or discards. */
+export const COMMIT_NUDGE_INSTRUCTION = "Your turn ended with uncommitted changes in your worktree. Commit the intended changes now so the worktree is clean, or explain in your reply why they must not be committed. Do not discard work.";
 export const CLEANUP_SAFETY_BUDGET_MS = 30_000;
 export const TERMINATION_SAFETY_BUDGET_MS = 15_000;
 export const STATUS_INSPECTION_BUDGET_MS = 5_000;
@@ -108,6 +112,8 @@ export type AllocationReconciliation<Kind extends AllocationKind = AllocationKin
 export type WorkerResult =
 	| { outcome: "candidate"; candidate: WorkspaceIdentity; diagnostic?: string }
 	| { outcome: "blocked" | "not_prompted"; diagnostic: string }
+	/** The exact turn finished in its valid owned worktree with tracked or untracked changes. */
+	| { outcome: "uncommitted"; diagnostic: string }
 	| { outcome: "unknown" | "interrupted"; diagnostic: string };
 
 export interface CheckRunResult {
@@ -652,17 +658,23 @@ function exactCommandResults(results: readonly CommandResult[], checks: readonly
 	});
 }
 
+function isCommitNudge(prompt: PromptRecord): boolean {
+	return prompt.kind === "followup" && prompt.instruction === COMMIT_NUDGE_INSTRUCTION;
+}
+
 function correctionEligible(request: ChangesetTaskRequest, attempt: TaskAttempt): boolean {
 	const initial = attempt.prompts[0];
 	if (initial?.kind !== "initial" || attempt.prompts.some((prompt) => prompt.kind === "correction" || prompt.status === "ambiguous")
 		|| attempt.termination) return false;
 	const latestPrompt = attempt.prompts.at(-1)!;
 	if (latestPrompt.status !== "settled") return false;
+	// A commit nudge continues its turn; it never consumes the correction window.
+	const assignments = attempt.prompts.filter((prompt) => !isCommitNudge(prompt)).length;
 	if (!attempt.candidate) {
-		return attempt.prompts.length === 1 && !attempt.preliminaryChecks && Boolean(initial.failure?.trim());
+		return assignments === 1 && !attempt.preliminaryChecks && Boolean(initial.failure?.trim());
 	}
 	const checks = attempt.preliminaryChecks;
-	return attempt.prompts.length === 1 && Boolean(checks
+	return assignments === 1 && Boolean(checks
 		&& checks.phase === "preliminary"
 		&& exactCommandResults(checks.results, request.checks)
 		&& sameIdentity(checks.candidate, attempt.candidate)
@@ -696,10 +708,10 @@ export function buildChangesetTaskPrompt(input: {
 		&& (typeof input.failure !== "string" || !input.failure.trim() || input.failure.trim() !== input.failure || input.failure.includes("\0"))) {
 		throw new Error("correction failure must be a non-empty exact string.");
 	}
-	if (input.kind === "followup"
+	if ((input.kind === "followup" || input.instruction !== undefined)
 		&& (typeof input.instruction !== "string" || !input.instruction.trim() || input.instruction.trim() !== input.instruction
 			|| input.instruction.includes("\0") || input.instruction.length > 32_000)) {
-		throw new Error("follow-up instruction must be non-empty exact text of at most 32000 characters.");
+		throw new Error(`${input.kind === "followup" ? "follow-up" : "correction"} instruction must be non-empty exact text of at most 32000 characters.`);
 	}
 	const checks = input.task.checks.map((check) => JSON.stringify({ command: check.command, args: check.args })).join("\n");
 	const upstreamTaskData = input.contexts.length
@@ -733,6 +745,7 @@ export function buildChangesetTaskPrompt(input: {
 		"Required checks (direct command/argv):",
 		checks,
 		...(input.kind === "correction" ? ["", "Correction failure:", input.failure!] : []),
+		...(input.kind === "correction" && input.instruction ? ["", "Main's instruction:", input.instruction] : []),
 		"",
 		"Work only in the exact worktree above. Commit the complete result and leave that worktree clean.",
 	].join("\n");
@@ -881,6 +894,50 @@ export class IsolatedRunner {
 			}
 		}
 		return { requests, invalidIds: inventory.invalidIds, leaseBusy };
+	}
+
+	/** Prune evidence across checkouts. A non-terminal state owns every resource name its saved text
+	 * mentions; an unreadable state owns every name its raw text mentions, or every name when unreadable. */
+	async pruneOwnership(checkouts: readonly string[]): Promise<PruneOwnership> {
+		const owners: { label: string; text?: string }[] = [];
+		let lease: string | undefined;
+		for (const checkout of checkouts) {
+			const root = realpathSync.native(checkout);
+			if (!lease && await this.store.hasProductiveRunLease(root)) lease = `productive lease is held by a live run in ${root}`;
+			const { states, invalidIds } = await this.store.list(root);
+			for (const { state } of states) {
+				if (!terminal(state)) owners.push({ label: `owned by ${state.status} request ${state.request.id}`, text: JSON.stringify(state) });
+			}
+			for (const id of invalidIds) {
+				let text: string | undefined;
+				try { text = await this.store.readRaw(root, id); } catch { /* It may own any name. */ }
+				owners.push({ label: `unreadable state ${id} in ${root} may own it`, text });
+			}
+		}
+		return { ...(lease ? { lease } : {}), owner: (name) => owners.find(({ text }) => text === undefined || text.includes(name))?.label };
+	}
+
+	/** After pruning, reconcile aborted requests that recorded a removed resource through the guarded abort path. */
+	async reconcilePrunedAborts(checkouts: readonly string[], names: readonly string[]): Promise<string[]> {
+		const lines: string[] = [];
+		for (const checkout of checkouts) {
+			const root = realpathSync.native(checkout);
+			const { requests, states } = await this.listRequests(root);
+			for (const [index, state] of states.entries()) {
+				const id = state.request.id;
+				const text = JSON.stringify(state);
+				if (requests[index]!.status !== "aborted · retained" || !names.some((name) => text.includes(name))) continue;
+				try {
+					await this.abort(id, root);
+					const after = (await this.listRequests(root)).requests.find((request) => request.id === id);
+					lines.push(after?.status === "aborted" ? `Reconciled cleanup of aborted request ${id}.`
+						: `Aborted request ${id} still has pending cleanup; inspect subagent_status.`);
+				} catch (error) {
+					lines.push(`Aborted request ${id} could not be reconciled: ${errorText(error)}`);
+				}
+			}
+		}
+		return lines;
 	}
 
 	canFollowup(root: string, requestId: string, taskId: string): boolean {
@@ -1070,6 +1127,7 @@ export class IsolatedRunner {
 				if (task.kind === "text") {
 					if (task.status !== "needs_attention") throw new Error(`Task ${task.taskId} is not waiting for deliberate attention.`);
 					if (request.action === "verify") throw new Error(`Text task ${task.taskId} cannot be verified.`);
+					if (request.instruction !== undefined) throw new Error(`Text task ${task.taskId} retry cannot take a worker instruction.`);
 					if (!textRetryEligible(state, task)) {
 						const attempt = task.attempts.at(-1);
 						if ((attempt && !["failed", "superseded"].includes(attempt.status)) || task.attempts.length >= 2) {
@@ -1082,7 +1140,7 @@ export class IsolatedRunner {
 					return await this.run(handle, scope, task.taskId);
 				}
 				if (task.status !== "needs_attention") throw new Error(`Task ${task.taskId} is not waiting for deliberate attention.`);
-				if (request.action === "retry") return await this.retry(handle, task, scope);
+				if (request.action === "retry") return await this.retry(handle, task, scope, request.instruction);
 				return await this.verifyRetainedTask(handle, task, scope);
 			} catch (error) {
 				if (error instanceof DurableRunStopped) return this.response(handle.state);
@@ -2425,6 +2483,8 @@ export class IsolatedRunner {
 		let kind: "initial" | "correction" | "followup" = initialKind;
 		let failure = task.failure;
 		let instruction = initialInstruction;
+		// A nudge keeps its dirty turn's exact clean pre-prompt lineage.
+		let nudgeFrom: WorkspaceIdentity | undefined;
 		for (;;) {
 			if (kind === "followup" && instruction === undefined) {
 				throw new Error("Follow-up worker execution requires an exact queued instruction.");
@@ -2441,11 +2501,12 @@ export class IsolatedRunner {
 			}
 			let preCandidate: WorkspaceIdentity;
 			try {
-				preCandidate = runtimeIdentity(await this.callProductive(handle, scope, async (context) => await this.gitRuntime.inspectTaskCandidate({
+				preCandidate = nudgeFrom ?? runtimeIdentity(await this.callProductive(handle, scope, async (context) => await this.gitRuntime.inspectTaskCandidate({
 					root: state.root,
 					task: request,
 					attempt,
 				}, context)), "Pre-prompt candidate identity");
+				nudgeFrom = undefined;
 			} catch (error) {
 				this.rethrowStopped(error);
 				this.attention(task, `Pre-prompt candidate identity is unavailable: ${errorText(error)}`);
@@ -2478,7 +2539,7 @@ export class IsolatedRunner {
 				kind,
 				status: "submitting",
 				preCandidate,
-				...(kind === "followup" ? { instruction } : {}),
+				...(instruction !== undefined ? { instruction } : {}),
 				at: nextAttemptEventAt(attempt, this.coordinatorRuntime.now()),
 			};
 			attempt.prompts.push(prompt);
@@ -2521,6 +2582,19 @@ export class IsolatedRunner {
 				return;
 			}
 			prompt.status = "settled";
+			if (worker.outcome === "uncommitted") {
+				prompt.failure = boundedRuntimeDiagnostic(worker.diagnostic, "uncommitted worker diagnostic");
+				if (attempt.prompts.some(isCommitNudge)) {
+					this.attention(task, "The commit nudge was sent, but the worker turn still left uncommitted changes in its worktree; they are retained for inspection.");
+					await this.saveProductive(handle);
+					return;
+				}
+				await this.saveProductive(handle);
+				kind = "followup";
+				instruction = COMMIT_NUDGE_INSTRUCTION;
+				nudgeFrom = preCandidate;
+				continue;
+			}
 			if (worker.outcome === "blocked") {
 				failure = boundedRuntimeDiagnostic(worker.diagnostic, "blocked worker diagnostic");
 				prompt.failure = failure;
@@ -2806,8 +2880,12 @@ export class IsolatedRunner {
 		handle: RunStateHandle,
 		task: ChangesetTaskState,
 		scope: RuntimeScope,
+		instruction?: string,
 	): Promise<RunResponse> {
 		const attempt = task.attempts.at(-1);
+		if (instruction !== undefined && !attempt?.prompts.length) {
+			throw new Error("A retry instruction requires a same-worker correction of a prompted attempt.");
+		}
 		if (!attempt) {
 			for (const pending of handle.state.tasks) {
 				if (pending.status === "needs_attention" && pending.attempts.length === 0) {
@@ -2822,11 +2900,26 @@ export class IsolatedRunner {
 			if (attempt.prompts.some((prompt) => prompt.status === "ambiguous")) {
 				throw new Error("An ambiguous delivered prompt is never replayed.");
 			}
-			if (!this.correctionAllowed(handle.state, changesetTaskRequest(handle.state, task.taskId), attempt)) {
+			const request = changesetTaskRequest(handle.state, task.taskId);
+			if (!this.correctionAllowed(handle.state, request, attempt)) {
 				throw new Error("The same-agent correction is unavailable or already used.");
 			}
+			// Build the correction before it is recorded: an oversized prompt must not use up the only correction.
+			// The reserve covers the worktree path and turn identity the host adds before delivery.
+			const assignment = buildChangesetTaskPrompt({
+				goal: handle.state.request.goal,
+				contexts: resolveTextTaskContexts(handle.state, request),
+				task: request,
+				kind: "correction",
+				worktreeCwd: allocationByKind(attempt, "agent")?.worktreeCwd ?? "",
+				failure: task.failure,
+				...(instruction === undefined ? {} : { instruction }),
+			});
+			if (Buffer.byteLength(assignment, "utf8") + CORRECTION_DELIVERY_RESERVE_BYTES > CHANGESET_TASK_PROMPT_MAX_BYTES) {
+				throw new Error(`Worker assignment exceeds ${CHANGESET_TASK_PROMPT_MAX_BYTES} bytes with delivery overhead; shorten the retry instruction.`);
+			}
 			task.status = "working";
-			await this.driveWorkerSafely(handle, task, scope, "correction");
+			await this.driveWorkerSafely(handle, task, scope, "correction", instruction);
 		} else {
 			if (attempt.termination || allocationByKind(attempt, "agent")) {
 				throw new Error("A promptless attempt with a terminated or potentially active saved agent cannot be retried productively.");

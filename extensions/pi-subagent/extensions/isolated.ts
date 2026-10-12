@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import type { JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
@@ -12,6 +13,7 @@ import {
 	type DirectProcessRunner,
 } from "../dist/git-runtime.js";
 import { HerdrHostRuntime } from "../dist/herdr-runtime.js";
+import { inspectPruneCandidates, listHerdrPanes, removePruneCandidates, type PruneGuards, type PruneItem } from "../dist/prune.js";
 import { runProcess as directRunProcess } from "../dist/process.js";
 import { RoleLaunchRuntime, type LaunchRuntimeOptions } from "../dist/launch-runtime.js";
 import { IsolatedRunner, type OperationContext, type RunResponse } from "../dist/runner.js";
@@ -36,10 +38,12 @@ import {
 } from "../dist/schema.js";
 import { FileRunStore } from "../dist/store.js";
 import { workerOutputForMain } from "./result-transport.ts";
-import type { IsolatedInventory } from "./subagent-command.ts";
+import type { IsolatedInventory, PrunePlan } from "./subagent-command.ts";
 
 const LOOKUP_ROOT_TIMEOUT_MS = 5_000;
 const PUBLIC_EVIDENCE_MAX_BYTES = 512;
+/** Tool results return failed review verdicts in full up to this bound; follow-ups keep the short preview. */
+const PUBLIC_REVIEW_VERDICT_MAX_BYTES = 32 * 1024;
 const WORKSPACE_WIDGET_KEY = "pi-subagent-workspaces";
 const WIDGET_FIELD_MAX_CHARS = 32;
 const MAX_WORKSPACE_WIDGET_LINES = 6;
@@ -175,10 +179,25 @@ function updateWorkspaceWidgetSafely(ctx: ExtensionContext, state: RunState, row
 	}
 }
 
-function boundedPublicText(value: string): string {
-	if (Buffer.byteLength(value, "utf8") <= PUBLIC_EVIDENCE_MAX_BYTES) return value;
-	let end = Math.min(value.length, PUBLIC_EVIDENCE_MAX_BYTES);
-	while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > PUBLIC_EVIDENCE_MAX_BYTES) end -= 1;
+/** Join report lines within a follow-up budget, naming how many were omitted. */
+function boundedReport(lines: readonly string[], omitted: string): string {
+	const report: string[] = [];
+	let bytes = 0;
+	let skipped = 0;
+	for (const line of lines.flatMap((entry) => entry.split("\n"))) {
+		const size = Buffer.byteLength(`${line}\n`, "utf8");
+		if (bytes + size > 7_900) { skipped++; continue; }
+		report.push(line);
+		bytes += size;
+	}
+	if (skipped) report.push(`[${skipped} ${omitted}]`);
+	return report.join("\n");
+}
+
+function boundedPublicText(value: string, maxBytes = PUBLIC_EVIDENCE_MAX_BYTES): string {
+	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+	let end = Math.min(value.length, maxBytes);
+	while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maxBytes) end -= 1;
 	return `${value.slice(0, end)}\n[truncated]`;
 }
 
@@ -199,16 +218,18 @@ function publicFailedCheck(evidence: CheckBatchEvidence | undefined) {
 	};
 }
 
-function publicFailedReview(evidence: ReviewEvidence | undefined) {
+function publicFailedReview(evidence: ReviewEvidence | undefined, verdictMaxBytes: number) {
 	if (!evidence || evidence.passed) return undefined;
+	const verdict = boundedPublicText(evidence.verdict, verdictMaxBytes);
 	return {
 		phase: evidence.phase,
-		verdict: boundedPublicText(evidence.verdict),
+		verdict,
+		verdictTruncated: verdict !== evidence.verdict,
 		identityChanged: !sameIdentity(evidence.tip, evidence.identityAfter),
 	};
 }
 
-function publicTaskRecovery(task: RunState["tasks"][number]) {
+function publicTaskRecovery(task: RunState["tasks"][number], verdictMaxBytes: number) {
 	if (task.kind === "text") {
 		const attempt = task.attempts.at(-1);
 		return {
@@ -225,7 +246,7 @@ function publicTaskRecovery(task: RunState["tasks"][number]) {
 
 	const attempt = task.attempts.at(-1);
 	const failedCheck = publicFailedCheck(attempt?.preliminaryChecks);
-	const failedReview = publicFailedReview(attempt?.preliminaryReview);
+	const failedReview = publicFailedReview(attempt?.preliminaryReview, verdictMaxBytes);
 	const cleanup = attempt?.cleanup
 		.filter((step) => step.status !== "completed")
 		.map((step) => ({
@@ -254,14 +275,14 @@ function publicTaskRecovery(task: RunState["tasks"][number]) {
 	};
 }
 
-function publicNeedsAttention(state: RunState, preferredTaskId?: string) {
+function publicNeedsAttention(state: RunState, verdictMaxBytes: number, preferredTaskId?: string) {
 	if (state.status !== "needs_attention") return undefined;
 	const task = state.tasks.find((candidate) => candidate.status === "needs_attention" && candidate.taskId === preferredTaskId)
 		?? state.tasks.find((candidate) => candidate.status === "needs_attention");
-	if (task) return publicTaskRecovery(task);
+	if (task) return publicTaskRecovery(task, verdictMaxBytes);
 	if (state.final.failure || state.final.checks?.passed === false || state.final.review?.passed === false) {
 		const failedCheck = publicFailedCheck(state.final.checks);
-		const failedReview = publicFailedReview(state.final.review);
+		const failedReview = publicFailedReview(state.final.review, verdictMaxBytes);
 		return {
 			scope: "final" as const,
 			...(state.final.failure ? { failure: boundedPublicText(state.final.failure) } : {}),
@@ -275,8 +296,8 @@ function publicNeedsAttention(state: RunState, preferredTaskId?: string) {
 	};
 }
 
-function publicState(state: RunState, preferredTaskId?: string) {
-	const needsAttention = publicNeedsAttention(state, preferredTaskId);
+function publicState(state: RunState, verdictMaxBytes: number, preferredTaskId?: string) {
+	const needsAttention = publicNeedsAttention(state, verdictMaxBytes, preferredTaskId);
 	return {
 		version: state.version,
 		id: state.request.id,
@@ -313,7 +334,7 @@ function publicState(state: RunState, preferredTaskId?: string) {
 				...(combinedTip ? { combinedTip } : {}),
 				...(correction ? { correction } : {}),
 				...(checks ? { checked: checks.passed, failedCheck: publicFailedCheck(checks) } : {}),
-				...(review ? { reviewed: review.passed, failedReview: publicFailedReview(review) } : {}),
+				...(review ? { reviewed: review.passed, failedReview: publicFailedReview(review, verdictMaxBytes) } : {}),
 				...(promotion ? { promotion: promotion.status, ...(promotion.mainAfter ? { mainAfter: promotion.mainAfter } : {}),
 					...(promotion.failure ? { promotionFailure: boundedPublicText(promotion.failure) } : {}) } : {}),
 				...(failure ? { failure: boundedPublicText(failure) } : {}),
@@ -329,6 +350,42 @@ function publicState(state: RunState, preferredTaskId?: string) {
 	};
 }
 
+/** Model-visible failed review verdicts from every task, the final gate, and each generation, within one shared budget.
+ * Pi shows the model `content`, not `structuredContent`; task reviews appear even while sibling tasks still run. */
+function failedReviewText(state: RunState): string {
+	const reviews = [
+		...state.tasks.flatMap((task) => {
+			const review = task.kind === "changeset" ? task.attempts.at(-1)?.preliminaryReview : undefined;
+			return review && !review.passed ? [{ label: `Task ${task.taskId}`, review }] : [];
+		}),
+		...(state.final.review && !state.final.review.passed ? [{ label: "Final", review: state.final.review }] : []),
+		...state.integration.generations.flatMap(({ number, review }) => review && !review.passed ? [{ label: `Integration generation ${number}`, review }] : []),
+	].reduce<{ label: string; review: ReviewEvidence }[]>((merged, entry) => {
+		// Show an identical verdict once, but keep every scope that failed with it.
+		const same = merged.find(({ review }) => review.verdict === entry.review.verdict);
+		if (same) same.label = `${same.label}, ${entry.label}`;
+		else merged.push({ ...entry });
+		return merged;
+	}, []);
+	let budget = PUBLIC_REVIEW_VERDICT_MAX_BYTES;
+	let omitted = 0;
+	const parts: string[] = [];
+	for (const { label, review } of reviews) {
+		if (budget <= 0) { omitted++; continue; }
+		const verdict = boundedPublicText(review.verdict, budget);
+		budget -= Buffer.byteLength(verdict, "utf8");
+		parts.push(`\n\n${label}: failed ${review.phase} review verdict${verdict !== review.verdict ? " (truncated)" : ""}:\n${workerOutputForMain(verdict)}`);
+	}
+	if (omitted) parts.push(`\n\n${omitted} more failed review verdict(s) omitted from this text; structuredContent lists each one.`);
+	return parts.join("");
+}
+
+function hasTruncatedVerdict(state: ReturnType<typeof publicState>): boolean {
+	const attention = state.needsAttention;
+	return Boolean(attention && "failedReview" in attention && attention.failedReview?.verdictTruncated)
+		|| state.integration.generations.some((generation) => generation.failedReview?.verdictTruncated);
+}
+
 function inspectionNotices({ state, main, continuation }: RunResponse): string[] {
 	const lines = [
 		`Isolated request ${state.request.id}: ${state.status}; accepted: ${state.accepted}; final: ${state.final.status}; Main: ${main?.status ?? "not checked"}.`,
@@ -338,7 +395,7 @@ function inspectionNotices({ state, main, continuation }: RunResponse): string[]
 		? `Main inspection unavailable: ${boundedPublicText(main.failure)}; expected: ${JSON.stringify(main.expected)}`
 		: `Main ${main.status}: ${JSON.stringify({ expected: main.expected, actual: main.actual })}`);
 	if (state.integration.refresh) lines.push(`Integration refresh: ${state.integration.refresh.status}${state.integration.refresh.failure ? `; blockage: ${boundedPublicText(state.integration.refresh.failure)}` : ""}.`);
-	const attention = publicNeedsAttention(state);
+	const attention = publicNeedsAttention(state, PUBLIC_EVIDENCE_MAX_BYTES);
 	if (attention) lines.push(`Reported blockage: ${JSON.stringify({ scope: attention.scope, failure: attention.failure, failedCheck: "failedCheck" in attention ? attention.failedCheck : undefined, failedReview: "failedReview" in attention ? attention.failedReview : undefined })}`);
 	if (state.final.failure) lines.push(`Final blockage: ${boundedPublicText(state.final.failure)}`);
 	for (const task of state.tasks) {
@@ -404,7 +461,7 @@ function toolResult(response: RunResponse, ctx: ExtensionContext, rowsByRequest:
 	return {
 		content: [{ type: "text" as const, text }],
 		details: {
-			state: publicState(response.state, preferredTaskId),
+			state: publicState(response.state, PUBLIC_REVIEW_VERDICT_MAX_BYTES, preferredTaskId),
 			...(response.main ? { main: response.main } : {}),
 			...(response.continuation ? { continuation: response.continuation } : {}),
 		},
@@ -415,6 +472,8 @@ export interface IsolatedSurface {
 	execute(request: ExecuteRequest, signal: AbortSignal | undefined, ctx: ExtensionContext): Promise<ReturnType<typeof toolResult>>;
 	inventory(cwd: string, current?: () => boolean): Promise<IsolatedInventory>;
 	recover(cwd: string): Promise<string>;
+	prunePlan(cwd: string): Promise<PrunePlan>;
+	prune(cwd: string, items: readonly PruneItem[], allowIgnored: boolean, current: () => boolean): Promise<string>;
 	inspect(root: string, requestId: string): Promise<readonly string[]>;
 	canFollowup(root: string, requestId: string, taskId: string): boolean;
 	enqueue(root: string, requestId: string, taskId: string, text: string, current: () => boolean): string;
@@ -487,6 +546,10 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 	pi.on("model_select", (event, ctx) => { latestCtx = { ...ctx, model: event.model } as ExtensionContext; });
 	pi.on("agent_settled", (_event, ctx) => { latestCtx = ctx; });
 
+	const pruneGuards = (root: string): PruneGuards => ({
+		ownership: async (checkouts) => await getComponents().runner.pruneOwnership(checkouts),
+		panes: async () => await listHerdrPanes(root),
+	});
 	const requireCurrent = (current: () => boolean) => {
 		if (!current() || sessionClosed) throw new Error("Session or branch changed; reopen /subagent.");
 	};
@@ -551,14 +614,17 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 			}
 			const state = response?.state ?? latestState;
 			try {
-				const details = state ? {
-					state: publicState(state, response?.continuation && "taskId" in response.continuation
-						? response.continuation.taskId : undefined),
+				const preview = state ? publicState(state, PUBLIC_EVIDENCE_MAX_BYTES, response?.continuation && "taskId" in response.continuation
+					? response.continuation.taskId : undefined) : undefined;
+				const details = preview ? {
+					state: preview,
 					...(response?.continuation ? { continuation: response.continuation } : {}),
 				} : { id };
 				pi.sendMessage({
 					customType: "pi-subagent-isolated-result",
-					content: text,
+					content: preview && hasTruncatedVerdict(preview)
+						? `${text}\n\nReview verdicts here are previews; run subagent_status for the full verdict.`
+						: text,
 					display: true,
 					details,
 				}, { triggerTurn: true, deliverAs: "followUp" });
@@ -597,7 +663,7 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 					reject(new Error(`Pi Subagent ${id} finished without a durable acknowledgement.`));
 					return;
 				}
-				deliver("terminal", `${response.text}\n\nState: ${JSON.stringify(publicState(response.state))}`, response);
+				deliver("terminal", `${response.text}\n\nState: ${JSON.stringify(publicState(response.state, PUBLIC_EVIDENCE_MAX_BYTES))}`, response);
 			},
 			(error: unknown) => {
 				finish();
@@ -628,15 +694,17 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			latestCtx = ctx;
 			const root = await lookupRoot(ctx.cwd, signal);
-			const result = toolResult(await getComponents().runner.status(params.id, root, signal), ctx, workspaceRowsByRequest);
+			const response = await getComponents().runner.status(params.id, root, signal);
+			const result = toolResult(response, ctx, workspaceRowsByRequest);
+			const content = [{ type: "text" as const, text: `${result.content[0]!.text}${failedReviewText(response.state)}` }];
 			// The projection is plain JSON; its conditional fields are typed optional rather than absent.
-			return { ...result, structuredContent: result.details as JsonValue };
+			return { ...result, content, structuredContent: result.details as JsonValue };
 		},
 	});
 	pi.registerTool({
 		name: "subagent_resume",
 		label: "Subagent resume",
-		description: "Resume one unfinished isolated request without resetting its recorded policy or correction count.",
+		description: "Resume one unfinished isolated request without resetting its recorded policy or correction count. For a retry that sends a same-worker correction, optional instruction (at most 32000 characters) is appended to that prompt as Main's instruction after the saved check or review failure; use it to name the exact fixes, including the review findings the worker must address. Other actions reject instruction.",
 		parameters: ResumeRequestParameters,
 		prepareArguments: parseResumeRequest,
 		exposure: "model-only",
@@ -748,17 +816,26 @@ export function registerIsolatedExtension(pi: ExtensionAPI, options: RegisterIso
 			leaseBusy ? "Wait for the active productive run; use subagent_status to inspect its current state. No work was taken over."
 				: "Main: inspect subagent_status for exact identities and blockers before deciding stage, promote, resume, or guarded release. No worker prompt, merge, promotion, or cleanup was replayed.",
 			];
-			const report: string[] = [];
-			let bytes = 0;
-			let omitted = 0;
-			for (const line of lines.flatMap((entry) => entry.split("\n"))) {
-				const size = Buffer.byteLength(`${line}\n`, "utf8");
-				if (bytes + size > 7_900) { omitted++; continue; }
-				report.push(line);
-				bytes += size;
-			}
-			if (omitted) report.push(`[${omitted} recovery report lines omitted; use subagent_status for exact request evidence.]`);
-			return report.join("\n");
+			return boundedReport(lines, "recovery report lines omitted; use subagent_status for exact request evidence.");
+		},
+		async prunePlan(cwd) {
+			const root = await lookupRoot(cwd);
+			return { root, items: await inspectPruneCandidates(root, cwd, pruneGuards(root)) };
+		},
+		async prune(cwd, items, allowIgnored, current) {
+			requireCurrent(current);
+			const root = await lookupRoot(cwd);
+			const { removals, checkouts } = await removePruneCandidates(root, cwd, items, allowIgnored,
+				{ ...pruneGuards(root), current: () => current() && !sessionClosed });
+			const removed = removals.filter(({ outcome }) => outcome === "removed");
+			const reconciled = removed.length
+				? await getComponents().runner.reconcilePrunedAborts(checkouts, removed.map(({ item }) => basename(item.branch))) : [];
+			const count = (outcome: string) => removals.filter((item) => item.outcome === outcome).length;
+			return boundedReport([
+				`Pi Subagent prune in ${root}: ${removed.length} removed, ${count("skipped")} skipped, ${count("failed")} failed.`,
+				...removals.map(({ outcome, item, reason }) => `${outcome}: ${item.path ?? "(no checkout)"} · ${item.branch} · ${reason}`),
+				...reconciled,
+			], "prune report lines omitted.");
 		},
 		async inspect(root, requestId) {
 			const response = await getComponents().runner.status(requestId, root);

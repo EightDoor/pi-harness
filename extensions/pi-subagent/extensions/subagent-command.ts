@@ -49,6 +49,22 @@ export interface IsolatedInventory {
 	invalidIds: readonly string[];
 }
 
+/** One pi-subagent branch and its checkout as reviewed by /subagent prune. */
+export interface PruneItem {
+	branch: string;
+	tip: string;
+	path?: string;
+	prunable: boolean;
+	/** Why the item is prunable, or every exact blocker. */
+	reason: string;
+	/** Ignored entries that removing the checkout deletes. */
+	ignored: readonly string[];
+}
+export interface PrunePlan {
+	root: string;
+	items: readonly PruneItem[];
+}
+
 /** Mutation adapters MUST check current() synchronously alongside their live ownership
  * validation and queue operation. They must not await between those operations. */
 export interface SubagentCommandAdapter {
@@ -57,6 +73,10 @@ export interface SubagentCommandAdapter {
 	stopDirect(task: DirectTask, entryId: string, current: () => boolean): Promise<string>;
 	isolated(cwd: string, current: () => boolean): Promise<IsolatedInventory>;
 	recover(cwd: string): Promise<string>;
+	/** Read-only review of pi-subagent worktrees and branches in the canonical repository. */
+	prunePlan(cwd: string): Promise<PrunePlan>;
+	/** Re-verify and remove reviewed prunable items; returns a bounded report. */
+	prune(cwd: string, items: readonly PruneItem[], allowIgnored: boolean, current: () => boolean): Promise<string>;
 	/** Read-only Role catalog report with routes and per-file load errors. */
 	roles(ctx: ExtensionContext): string;
 	inspectInTab(root: string, requestId: string, ctx: ExtensionContext, current: () => boolean): Promise<{ ref: string; tabId: string; name: string; sessionFile: string }>;
@@ -73,6 +93,39 @@ const errorText = (error: unknown): string => clean(error instanceof Error ? err
 const completed = (status: string) => ["completed", "success", "failed", "failure", "aborted", "integrated"].includes(status);
 const priority = (status: string) => /attention|blocked|retained|failed/i.test(status) ? 0 : completed(status) ? 2 : 1;
 
+const ignoredSummary = ({ ignored }: PruneItem) => !ignored.length ? "none"
+	: `${ignored.length} (${ignored.slice(0, 5).join(", ")}${ignored.length > 5 ? `, +${ignored.length - 5} more` : ""})`;
+const PRUNE_IGNORED_CONFIRM_CODE_POINTS = 4_000;
+const NOT_SHOWN = "they are not removed in this run; run /subagent prune again after this run.";
+
+/** Fit whole item lines within `max` code points; never cut silently, and report exactly which items were shown. */
+function fitItems<T>(header: string, items: readonly T[], line: (item: T) => string, max: number): { text: string; shown: T[] } {
+	const lines = [header];
+	const shown: T[] = [];
+	let size = [...header].length;
+	const reserve = [...NOT_SHOWN].length + 32;
+	for (const item of items) {
+		const text = line(item);
+		const length = [...text].length + 1;
+		if (size + length + reserve > max) break;
+		lines.push(text);
+		size += length;
+		shown.push(item);
+	}
+	if (shown.length < items.length) lines.push(`+${items.length - shown.length} more not shown; ${NOT_SHOWN}`);
+	return { text: lines.join("\n"), shown };
+}
+
+/** Prunable items come first so a long blocked list cannot hide them; only shown items may be removed. */
+function pruneReview({ root, items }: PrunePlan): { text: string; shown: PruneItem[] } {
+	if (!items.length) return { text: `No pi-subagent worktrees or branches in ${root}.`, shown: [] };
+	const prunable = items.filter((item) => item.prunable).length;
+	return fitItems(`Subagent prune review in ${root}: ${prunable} prunable, ${items.length - prunable} blocked.`,
+		[...items.filter((item) => item.prunable), ...items.filter((item) => !item.prunable)],
+		(item) => clean(`${item.prunable ? "✓ prunable" : "✗ blocked"} · ${item.path ?? "(no checkout)"} · ${item.branch} · ${item.tip.slice(0, 12)} · ${item.reason} · ignored: ${ignoredSummary(item)}`, 600),
+		ROLES_REPORT_CODE_POINTS);
+}
+
 type Choice<T> = { label: string; value: T };
 async function choose<T>(ctx: ExtensionContext, title: string, items: readonly Choice<T>[]): Promise<T | undefined> {
 	// Numeric suffixes are UI-only. Never parse display text into an identity.
@@ -84,10 +137,10 @@ async function choose<T>(ctx: ExtensionContext, title: string, items: readonly C
 
 export function registerSubagentCommand(pi: ExtensionAPI, adapter: SubagentCommandAdapter): void {
 	pi.registerCommand("subagent", {
-		description: "Inspect direct and isolated work, list Roles with /subagent roles, or recover orphaned isolated requests with /subagent recover",
+		description: "Inspect direct and isolated work, list Roles with /subagent roles, recover orphaned isolated requests with /subagent recover, or remove merged leftover worktrees with /subagent prune",
 		handler: async (args, ctx) => {
 			const command = args.trim();
-			if (command && command !== "recover" && command !== "roles") throw new Error("Usage: /subagent [recover|roles]");
+			if (command && !["prune", "recover", "roles"].includes(command)) throw new Error("Usage: /subagent [prune|recover|roles]");
 			if (command === "roles") {
 				const report = clean(adapter.roles(ctx), ROLES_REPORT_CODE_POINTS, true);
 				if (ctx.hasUI) ctx.ui.notify(report, "info");
@@ -121,6 +174,39 @@ export function registerSubagentCommand(pi: ExtensionAPI, adapter: SubagentComma
 				ctx.ui.notify("Session or branch changed; reopen /subagent in the current context.", "warning");
 				return false;
 			};
+			if (command === "prune") {
+				const plan = await adapter.prunePlan(ctx.cwd);
+				const reviewed = pruneReview(plan);
+				const review = clean(reviewed.text, ROLES_REPORT_CODE_POINTS, true);
+				if (!ctx.hasUI) {
+					pi.sendMessage({ customType: "pi-subagent-prune", content: `${review}\nReport only: removal requires interactive confirmation.`, display: true });
+					return;
+				}
+				if (!valid()) return;
+				ctx.ui.notify(review, "info");
+				const prunable = reviewed.shown.filter((item) => item.prunable);
+				if (!prunable.length) return;
+				const confirmed = await ctx.ui.confirm("Prune subagent worktrees", `Remove all ${prunable.length} prunable item(s) listed above? Each is re-verified first; unique commits, tracked or untracked changes, and unlisted items are never removed.`);
+				if (!valid() || !confirmed) return;
+				const ignored = prunable.filter((item) => item.ignored.length);
+				// The header uses the full count's width so the shown count always fits.
+				const ignoredList = fitItems(`Also remove ${ignored.length} checkout(s) with ignored files? This permanently deletes these ignored entries and everything inside them:`,
+					// Approval names every ignored entry; a checkout whose full list does not fit is left out of this run.
+					ignored, (item) => clean(`${item.path}: ${item.ignored.join(", ")}`, Number.MAX_SAFE_INTEGER), PRUNE_IGNORED_CONFIRM_CODE_POINTS);
+				const approvable = ignoredList.shown;
+				const allowIgnored = approvable.length > 0 && await ctx.ui.confirm("Delete ignored content",
+					clean(ignoredList.text.replace(`Also remove ${ignored.length} checkout(s)`, `Also remove ${approvable.length} checkout(s)`), PRUNE_IGNORED_CONFIRM_CODE_POINTS, true));
+				if (!valid()) return;
+				const kept = ignored.length - (allowIgnored ? approvable.length : 0);
+				if (kept) ctx.ui.notify(`Kept ${kept} checkout(s) with ignored content; their deletion was not approved.`, "info");
+				const selected = prunable.filter((item) => !item.ignored.length || (allowIgnored && approvable.includes(item)));
+				if (!selected.length) return;
+				try {
+					const report = await adapter.prune(ctx.cwd, selected, allowIgnored, current);
+					if (valid()) ctx.ui.notify(clean(report, ROLES_REPORT_CODE_POINTS, true), "info");
+				} catch (error) { if (valid()) ctx.ui.notify(`Prune failed: ${errorText(error)}`, "error"); }
+				return;
+			}
 			let history = false;
 			for (;;) {
 				if (!valid()) return;
