@@ -1,5 +1,5 @@
 import { validateCommitMessage, commitStagedPaths, inspectPendingCommit, requirePendingCommit, stageCommitPaths, type PendingCommit } from "./git-commit.ts";
-import type { PrRun } from "./pr-run.ts";
+import { checkTimeoutMs, type PrRun } from "./pr-run.ts";
 import { spawnBounded, type Exec } from "@henryqw/pi-process";
 import { cloneCurrentPullRequest, loadCurrentPullRequest, readValidatedRemoteAuthority, samePullRequestSnapshot, type CurrentPullRequest } from "./pr-github.ts";
 import { extensionExecApi, inspectWorktreeState, isAncestor, parseStatusSnapshot, readHead, readRemoteOid, requiredText, runChecked, validatePaths, withWorktreeLock } from "./pr-execution.ts";
@@ -108,7 +108,7 @@ export class PullRequestWorkPublisher {
 			this.options.run?.beginChecks("publish-work", head, checks);
 			try {
 				await runChecked(this.exec, "git", ["diff", "--check", this.authority.head.oid, head], this.execOptions());
-				for (const check of checks) await runChecked(this.exec, check.command, check.args, this.execOptions());
+				for (const check of checks) await runChecked(this.exec, check.command, check.args, { ...this.execOptions(), timeoutMs: checkTimeoutMs(this.options.run) });
 				await this.authorityCheck();
 				if (await readHead(this.exec, this.execOptions()) !== head || await inspectWorktreeState(this.exec, this.execOptions()) !== "clean") throw new Error("Validation changed local HEAD or worktree");
 			} catch (error) {
