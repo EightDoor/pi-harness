@@ -784,7 +784,7 @@ test("runs exact coverage, guarded publication, fresh resolution, checks, and fi
 	assert.equal(app.world.replyBody, published.publicationHead);
 
 	app.world.body = "late edit";
-	await assert.rejects(workflow.finalize(resolved.guard, []), /declared final projection/);
+	await assert.rejects(workflow.finalize(resolved.guard, []), /Feedback changed after refresh/);
 	app.world.body = "please fix";
 	assert.deepEqual(await workflow.finalize(resolved.guard, []), {
 		kind: "finalized", pullRequestUrl: "https://github.com/acme/project/pull/42", head: published.publicationHead, checks: 0,
@@ -916,6 +916,52 @@ test("published sweep retains only Bot body edits as non-actionable", async (t) 
 		await workflow.finalize(resolved.guard, []);
 		assert.equal(await needsFeedbackAttention(app.current(), { cwd: app.root, agentDir: app.agentDir, exec,
 			load: async () => ({ kind: "current" as const, pullRequest: app.current() }) }), authorType !== "Bot", authorType);
+	}
+});
+
+test("finalize requires resolve and applies refresh rules to later status edits", async (t) => {
+	for (const authorType of ["Bot", "User"]) {
+		await t.test(authorType, async (t) => {
+			const app = fixture();
+			t.after(app.cleanup);
+			app.world.extraBody = "Deploy: build in progress";
+			// Shaped like a real PR: edited status comments, two reviews, and an already-resolved thread.
+			const exec: Exec = async (command, args, options) => {
+				const response = await app.exec(command, args, options);
+				if (command !== "gh" || !options.stdin?.includes("query Feedback(")) return response;
+				const value = JSON.parse(response.stdout);
+				const pullRequest = value.data.repository.pullRequest;
+				for (const node of pullRequest.comments.nodes) node.author.__typename = authorType;
+				pullRequest.reviews.nodes.push(review("review-2"));
+				pullRequest.reviewThreads.nodes.unshift(thread("thread-0", true));
+				return result(JSON.stringify(value));
+			};
+			const workflow = app.workflow(undefined, { exec });
+			const started = await workflow.start();
+			const decisions = ledger(started).map((entry) => entry.kind === "conversation_comment" || entry.id.startsWith("thread-0")
+				? { ...entry, disposition: "non-actionable" as const, note: "Status report only" } : entry);
+			const published = await publishRecorded(workflow, await workflow.record(started.guard, decisions, []));
+			const refreshed = await workflow.refresh(published.guard);
+			// The projection is the state after resolve, not live GitHub state.
+			assert.deepEqual(refreshed.projection?.threads, [{ id: "thread-0", isResolved: true }, { id: "thread-1", isResolved: true }]);
+			await assert.rejects(workflow.finalize(refreshed.guard, []), /Call resolve before finalize; review threads are still unresolved: thread-1$/);
+			const resolved = await workflow.resolve(refreshed.guard);
+			assert.equal(app.world.mutationCalls, 1);
+			app.world.body = "Review: completed";
+			app.world.extraBody = "Deploy: successful";
+			app.world.threadLocation = { line: null, startLine: null, isOutdated: true };
+			if (authorType === "User") {
+				await assert.rejects(workflow.finalize(resolved.guard, []), /Feedback changed after refresh; call refresh, then resolve and finalize/);
+				const again = await workflow.refresh(resolved.guard);
+				assert.equal(again.plan?.ledger.find(({ id }) => id === "conversation-2")?.disposition, "blocked");
+				await workflow.finalize((await workflow.resolve(again.guard)).guard, []);
+			} else {
+				await workflow.finalize(resolved.guard, []);
+			}
+			assert.equal(existsSync(await workflow.recoveryPath()), false);
+			assert.equal(await needsFeedbackAttention(app.current(), { cwd: app.root, agentDir: app.agentDir, exec,
+				load: async () => ({ kind: "current" as const, pullRequest: app.current() }) }), authorType === "User");
+		});
 	}
 });
 
@@ -1201,6 +1247,50 @@ test("resume permits retry only after proving a lost thread mutation was not app
 	assert.equal(app.world.mutationCalls, 2);
 });
 
+test("resolve and its recovery apply refresh rules to status edits", async (t) => {
+	for (const scenario of ["before", "human", "during", "lost", "unapplied"] as const) {
+		await t.test(scenario, async (t) => {
+			const app = fixture();
+			t.after(app.cleanup);
+			const exec: Exec = async (command, args, options) => {
+				if (options.stdin?.includes("resolveReviewThread")) app.world.body = "Deploy: successful";
+				const response = await app.exec(command, args, options);
+				if (command !== "gh" || !options.stdin?.includes("query Feedback(")) return response;
+				const value = JSON.parse(response.stdout);
+				value.data.repository.pullRequest.comments.nodes[0].author.__typename = scenario === "human" ? "User" : "Bot";
+				return result(JSON.stringify(value));
+			};
+			const workflow = app.workflow(undefined, { exec });
+			const started = await workflow.start();
+			const decisions = ledger(started).map((entry) => entry.id === "conversation-1"
+				? { ...entry, disposition: "non-actionable" as const, note: "Status report only" } : entry);
+			const published = await publishRecorded(workflow, await workflow.record(started.guard, decisions, []));
+			if (scenario !== "human") app.world.body = "Deploy: in progress";
+			let guard = (await workflow.refresh(published.guard)).guard;
+			if (scenario === "before" || scenario === "human") app.world.body = "Deploy: successful";
+			if (scenario === "human") {
+				await assert.rejects(workflow.resolve(guard), /Feedback changed before thread resolution; call refresh/);
+				assert.equal(app.world.replyCalls + app.world.mutationCalls, 0);
+				guard = (await workflow.refresh(guard)).guard;
+			}
+			app.world.loseMutationResponse = scenario === "lost" || scenario === "unapplied";
+			app.world.applyMutation = scenario !== "unapplied";
+			if (app.world.loseMutationResponse) {
+				await assert.rejects(workflow.resolve(guard), /mutation response lost/);
+				const resumed = await workflow.resume();
+				assert.deepEqual(resumed.attempts.resolutions.map(({ step }) => step), scenario === "lost" ? ["reply", "resolve"] : ["reply"]);
+				app.world.loseMutationResponse = false;
+				app.world.applyMutation = true;
+				guard = resumed.guard;
+			}
+			const resolved = await workflow.resolve(guard);
+			assert.equal(resolved.phase, "resolved");
+			assert.equal(app.world.mutationCalls, scenario === "unapplied" ? 2 : 1);
+			await workflow.finalize(resolved.guard, []);
+		});
+	}
+});
+
 test("non-actionable threads receive the approved reason before resolution", async (t) => {
 	const app = fixture();
 	t.after(app.cleanup);
@@ -1476,6 +1566,43 @@ test("blocked standalone feedback remains attention-worthy after finalization", 
 	assert.equal(refreshed.plan?.ledger.find(({ id }) => id === "conversation-2")?.disposition, "blocked");
 	const resolved = await workflow.resolve(refreshed.guard);
 	await workflow.finalize(resolved.guard, []);
+	assert.equal(await needsFeedbackAttention(app.current(), options), true);
+});
+
+test("bot conversation comments neither start nor restart feedback attention", async (t) => {
+	const app = fixture();
+	t.after(app.cleanup);
+	let botOnly = true;
+	const exec: Exec = async (command, args, options) => {
+		const response = await app.exec(command, args, options);
+		if (command !== "gh" || !options.stdin?.includes("query Feedback(")) return response;
+		const value = JSON.parse(response.stdout);
+		const pullRequest = value.data.repository.pullRequest;
+		for (const node of pullRequest.comments.nodes) if (node.id === "conversation-2") node.author.__typename = "Bot";
+		if (botOnly) {
+			pullRequest.comments.nodes = pullRequest.comments.nodes.filter(({ id }: { id: string }) => id === "conversation-2");
+			pullRequest.reviews.nodes = [];
+			pullRequest.reviewThreads.nodes = [];
+		}
+		return result(JSON.stringify(value));
+	};
+	const options = { cwd: app.root, agentDir: app.agentDir, exec, load: async () => ({ kind: "current" as const, pullRequest: app.current() }) };
+	app.world.extraBody = "Deploy: in progress";
+	assert.equal(await needsFeedbackAttention(app.current(), options), false);
+	botOnly = false;
+	app.world.extraBody = null;
+	assert.equal(await needsFeedbackAttention(app.current(), options), true);
+	const workflow = app.workflow(undefined, { exec });
+	const started = await workflow.start();
+	const published = await publishRecorded(workflow, await workflow.record(started.guard, ledger(started), []));
+	const refreshed = await workflow.refresh(published.guard);
+	await workflow.finalize((await workflow.resolve(refreshed.guard)).guard, []);
+	assert.equal(await needsFeedbackAttention(app.current(), options), false);
+	app.world.extraBody = "Deploy: in progress";
+	assert.equal(await needsFeedbackAttention(app.current(), options), false);
+	app.world.extraBody = "Deploy: successful";
+	assert.equal(await needsFeedbackAttention(app.current(), options), false);
+	app.world.body = "please also fix the other file";
 	assert.equal(await needsFeedbackAttention(app.current(), options), true);
 });
 
