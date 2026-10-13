@@ -65,19 +65,21 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 	let ticking = false;
 	let running = false;
 	let lastConfigError: string | undefined;
+	let lastStateError: string | undefined;
 	// Renewed on session start so a session switch in the same Pi process revives scheduling.
 	let shutdown = new AbortController();
 
 	registerModelTask(pi, CRON_JOB_TASK);
 
-	const loadConfig = (ctx: ExtensionContext): CronConfig | undefined => {
+	/** Background ticks show each distinct error once; an explicit command always shows it. */
+	const loadConfig = (ctx: ExtensionContext, repeat = false): CronConfig | undefined => {
 		try {
 			const loaded = configStore.loadSync().value;
 			lastConfigError = undefined;
 			return loaded;
 		} catch (error) {
 			const message = `pi-cron config at ${configStore.path} is invalid; jobs are paused until it is fixed: ${errorText(error)}`;
-			if (message !== lastConfigError && ctx.hasUI) ctx.ui.notify(message, "error");
+			if ((repeat || message !== lastConfigError) && ctx.hasUI) ctx.ui.notify(message, "error");
 			lastConfigError = message;
 			return undefined;
 		}
@@ -194,9 +196,13 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 				if (!job || !jobEnabled(job)) continue;
 				try {
 					const run = await runJob(latestCtx, config, job, false);
+					lastStateError = undefined;
 					if ("done" in run) await run.done;
 				} catch (error) {
-					if (!signal.aborted && latestCtx.hasUI) latestCtx.ui.notify(`pi-cron could not schedule ${job.id}: ${errorText(error)}`, "error");
+					// A broken or locked state file fails every job alike; show each distinct error once.
+					const message = errorText(error);
+					if (message !== lastStateError && !signal.aborted && latestCtx.hasUI) latestCtx.ui.notify(`pi-cron could not schedule ${job.id}: ${message}`, "error");
+					lastStateError = message;
 				}
 			}
 		} finally {
@@ -222,7 +228,7 @@ export default function cronExtension(pi: ExtensionAPI, options: CronExtensionOp
 		description: "list scheduled jobs, run one now, or enable/disable it",
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
-			const config = loadConfig(ctx);
+			const config = loadConfig(ctx, true);
 			if (!config) return;
 			const [verb, target] = args.trim().split(/\s+/);
 			if (verb === "run") {

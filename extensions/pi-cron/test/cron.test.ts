@@ -312,5 +312,22 @@ test("an invalid config pauses jobs with one visible error", async () => {
 	await h.emit("session_start");
 	assert.equal(h.notices.filter((notice) => notice.includes("is invalid; jobs are paused")).length, 1, h.notices.join("\n"));
 	assert.equal(h.prepared.length, 0);
+	await h.command("");
+	await h.command("run x");
+	assert.equal(h.notices.filter((notice) => notice.includes("is invalid; jobs are paused")).length, 3, "each command shows the error again");
 	await h.emit("session_shutdown");
+});
+
+test("an invalid state file shows one error across jobs and ticks", async () => {
+	await writeJobs(["first", "second"].map((id) => ({ id, every: "1d", role: "scout", cwd: agentDir, prompt: "Go." })));
+	const statePath = join(agentDir, "config", "pi-cron", "state.json");
+	await writeFile(statePath, "{");
+	const h = harness(async () => ({ outcome: "success", output: "" }));
+	await h.emit("session_start");
+	await h.settle();
+	await h.emit("session_start");
+	await h.settle();
+	assert.equal(h.notices.filter((notice) => notice.includes("could not schedule")).length, 1, h.notices.join("\n"));
+	await h.emit("session_shutdown");
+	await rm(statePath, { force: true });
 });
