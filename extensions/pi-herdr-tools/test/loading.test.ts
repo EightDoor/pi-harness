@@ -27,6 +27,39 @@ test("package loading registers all Herdr commands through one extension", async
 	);
 });
 
+test("package startup warns once per session about a missing task-model config", async (t) => {
+	const isolated = await mkdtemp(join(tmpdir(), "pi-herdr-tools-task-models-"));
+	const previous = { agentDir: process.env.PI_CODING_AGENT_DIR, tmp: process.env.TMPDIR };
+	process.env.PI_CODING_AGENT_DIR = isolated;
+	process.env.TMPDIR = isolated;
+	t.after(async () => {
+		for (const [key, value] of [["PI_CODING_AGENT_DIR", previous.agentDir], ["TMPDIR", previous.tmp]] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		await rm(isolated, { recursive: true, force: true });
+	});
+	const sessionManager = SessionManager.inMemory(isolated);
+	const warnings: string[] = [];
+	// A reload loads a fresh extension instance for the same session.
+	for (const reason of ["startup", "reload"] as const) {
+		const loaded = await discoverAndLoadExtensions([packageRoot], isolated, isolated);
+		assert.deepEqual(loaded.errors, []);
+		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, isolated, sessionManager, undefined as never);
+		const errors: string[] = [];
+		runner.onError((error) => errors.push(error.error));
+		runner.bindCore({ getSessionName: () => undefined } as never, {} as never);
+		runner.setUIContext({
+			notify: (message: string, type?: string) => warnings.push(`${type}: ${message}`),
+			setWidget() {}, setStatus() {},
+		} as unknown as ExtensionUIContext, "tui");
+		await runner.emit({ type: "session_start", reason });
+		await runner.emit({ type: "session_shutdown", reason: "quit" });
+		assert.deepEqual(errors, []);
+	}
+	assert.deepEqual(warnings, ["warning: Task model config is missing. Run /task-models to configure task routes."]);
+});
+
 type Kind = "select" | "confirm" | "input" | "editor" | "custom";
 type Pending = { kind: Kind; resolve(value?: unknown): void; reject(error: Error): void };
 
