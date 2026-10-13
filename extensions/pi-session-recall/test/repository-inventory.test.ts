@@ -326,6 +326,22 @@ process.exit(9);`;
 		}
 	});
 
+	it("accepts valid UTF-8 that contains a literal U+FFFD in an indexed path and a manifest", async () => {
+		const root = makeRepository();
+		try {
+			write(root, "package.json", JSON.stringify({ description: "caf\uFFFD", scripts: { build: "tsc" } }));
+			write(root, "scripts/run\uFFFD.sh", "#!/bin/sh\n", 0o755);
+			runGit(root, ["add", "package.json", "scripts"]);
+
+			const inventory = await inventoryRepository(makePi(), { cwd: root, signal: new AbortController().signal });
+
+			assert.deepEqual(inventory.packageScripts, [{ path: "package.json", name: "build", command: "tsc" }]);
+			assert.deepEqual(inventory.executableScripts, ["scripts/run\uFFFD.sh"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects invalid UTF-8 and malformed, unterminated, duplicate, or conflicted index records", async (t) => {
 		await t.test("invalid UTF-8 root", async () => {
 			await withGitShim(`process.stdout.write(Buffer.from([0xff, 0x0a]));`, async (cwd) => {
@@ -405,14 +421,13 @@ process.exit(9);`;
 			["truncated content", Buffer.from(`${OID40} blob 2\n{`), /invalid Git batch output/],
 			["missing content delimiter", Buffer.from(`${OID40} blob 2\n{}`), /invalid Git batch output/],
 			["extra output", Buffer.concat([batchRecord(OID40, "{}"), Buffer.from("extra")]), /invalid Git batch output/],
-			["invalid UTF-8 blob", batchRecord(OID40, Buffer.from([0xff]), { size: "1" }), /Malformed repository manifest/],
-			["literal replacement character", batchRecord(OID40, "�"), /Malformed repository manifest/],
+			["invalid UTF-8 blob", batchRecord(OID40, Buffer.concat([Buffer.from('{"a":"'), Buffer.from([0xff]), Buffer.from('"}')])), /Malformed repository manifest/],
 			["malformed JSON", batchRecord(OID40, "{"), /Malformed repository manifest/],
 			["stdout overflow", Buffer.alloc(17 * 1024 * 1024, 0x78), /stdout exceeded its limit/],
 		];
 		for (const [name, batch, expected] of failures) {
 			await t.test(name, async () => {
-				const size = name === "invalid UTF-8 blob" || name === "malformed JSON" ? 1 : name === "literal replacement character" ? 3 : 2;
+				const size = name === "invalid UTF-8 blob" ? 9 : name === "malformed JSON" ? 1 : 2;
 				await withGitShim(indexShim(indexRecord("100644", OID40, "0", "package.json"), {
 					batchCheck: `${OID40} blob ${size}\n`,
 					batch,
