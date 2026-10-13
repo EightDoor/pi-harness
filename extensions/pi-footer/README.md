@@ -96,11 +96,53 @@ Statuses from other extensions, including Ponytail and `pi-rewind`, share the le
 
 ## Config
 
-Package-owned: `~/.pi/agent/config/pi-open-in/config.json` (under `getAgentDir()` when overridden). The retained `pi-open-in` home belongs to the open commands now shipped here.
+Package-owned: `~/.pi/agent/config/pi-footer/config.json` for footer colors and `~/.pi/agent/config/pi-open-in/config.json` for the open command (both under `getAgentDir()` when overridden). The retained `pi-open-in` home belongs to the open commands now shipped here.
 
 | Name | Description | Values | Default |
 | --- | --- | --- | --- |
+| `colors` | Colors for footer-owned text by role. | Object that maps color roles to theme tokens, `#RGB`, `#RRGGBB`, `oklch(...)`, `okhsl(...)`, or an ANSI index from `0` to `255`. | Built-in colors. |
 | `command` | Command that `/open` runs. Required when the file exists. | Non-empty string. | `"code"` |
+
+The footer reads `colors` once per session start; run `/reload` after editing it. The file is never rewritten. A missing file or a missing role keeps the built-in color. At each session start, an invalid file shows a notification with the path and the reason, and the whole color config falls back to the built-in colors.
+
+### Footer color roles
+
+Every role is optional:
+
+| Role | Surface |
+| --- | --- |
+| `repository` | Repository name on the first line. |
+| `branch` | Branch or checkout name, still hyperlink-wrapped when the terminal supports it. |
+| `gitStatus` | Git badges such as `[+2 ~3 ↑1]`. |
+| `input`, `output`, `cache`, `throughput`, `cost`, `context` | The six usage metrics on the second line. |
+| `model` | Active model and routed physical model. |
+| `runtime` | Cumulative agent-work time on the third line. |
+| `codegraphActive` | The `● CG` badge during a direct `codegraph_explore` call. |
+| `separator` | Middle dots, bullets, arrows, and the truncation ellipsis. |
+
+```json
+{
+  "colors": {
+    "repository": "muted",
+    "branch": "accent",
+    "gitStatus": "warning",
+    "input": "#4ec9b0",
+    "output": "#9cdcfe",
+    "cache": "#c586c0",
+    "throughput": "#dcdcaa",
+    "cost": "#ce9178",
+    "context": "#89d185",
+    "model": "text",
+    "runtime": "muted",
+    "codegraphActive": "accent",
+    "separator": "dim"
+  }
+}
+```
+
+Theme tokens are `accent`, `dim`, `muted`, `text`, `success`, `warning`, `error`, and `thinkingText`. Thinking levels keep their built-in gradient, and statuses from other extensions keep their producer colors; the `colors` object controls neither.
+
+### Open command
 
 A missing file silently uses the default command, `code`. An invalid existing file makes `/open` fail visibly and stays unchanged. See Limits and recovery. `/open` reads the config on every run. Only `/set-open-in` writes the file, atomically. Reads do not create or write the config home.
 
