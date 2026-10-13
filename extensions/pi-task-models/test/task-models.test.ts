@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { lock } from "proper-lockfile";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import {
 	availableTaskModels,
@@ -335,6 +336,44 @@ test("Option+S saves all current profiles, merges names, confirms replacement, a
 		assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { "my-setup": updated, ["__proto__"]: profiles });
 		await handler("preset", { ui: { select: async () => "__proto__", notify() {} } });
 		assert.deepEqual(loadTaskModelsConfig(dir).value.profiles, profiles);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("preset saving refuses a name another session saved after the unlocked check", async () => {
+	const dir = tempDir();
+	try {
+		const { handler } = controlPlane(eventBus(), dir);
+		mkdirSync(join(dir, "config", "pi-task-models"), { recursive: true });
+		writeFileSync(configFile(dir), JSON.stringify({ profiles: { fast: {
+			primary: { model: "provider/model", thinkingLevel: "off" },
+		} } }));
+		const path = join(dir, "config", "pi-task-models", "presets.json");
+		const other = `${JSON.stringify({ shared: { fav: { primary: { model: "provider/other", thinkingLevel: "high" } } } })}\n`;
+		const notices: Array<[string, string]> = [];
+		await handler("", { mode: "tui", ui: {
+			custom: async (factory: any) => {
+				let result: unknown;
+				factory({ requestRender() {} }, { fg: (_color: string, text: string) => text }, {}, (value: unknown) => { result = value; }).handleInput("\x1bs");
+				return result;
+			},
+			// Another session holds the lock across the unlocked check, then saves the same name.
+			input: async () => {
+				const release = await lock(path, { realpath: false });
+				setTimeout(async () => {
+					writeFileSync(path, other);
+					await release();
+				}, 50);
+				return "shared";
+			},
+			confirm: async () => assert.fail("must not confirm a name that was absent at the unlocked check"),
+			notify(message: string, level: string) { notices.push([message, level]); },
+		} });
+		assert.equal(readFileSync(path, "utf8"), other);
+		assert.equal(notices.length, 1);
+		assert.match(notices[0]![0], /Another session saved preset "shared"; try again\./);
+		assert.equal(notices[0]![1], "error");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

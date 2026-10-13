@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,7 +27,8 @@ test("package loading registers all Herdr commands through one extension", async
 	);
 });
 
-test("package startup warns once per session about a missing task-model config", async (t) => {
+/** Start and reload the package once per session; return its notifications. */
+async function startupWarnings(t: TestContext, config?: string): Promise<string[]> {
 	const isolated = await mkdtemp(join(tmpdir(), "pi-herdr-tools-task-models-"));
 	const previous = { agentDir: process.env.PI_CODING_AGENT_DIR, tmp: process.env.TMPDIR };
 	process.env.PI_CODING_AGENT_DIR = isolated;
@@ -39,6 +40,10 @@ test("package startup warns once per session about a missing task-model config",
 		}
 		await rm(isolated, { recursive: true, force: true });
 	});
+	if (config !== undefined) {
+		await mkdir(join(isolated, "config", "pi-task-models"), { recursive: true });
+		await writeFile(join(isolated, "config", "pi-task-models", "config.json"), config);
+	}
 	const sessionManager = SessionManager.inMemory(isolated);
 	const warnings: string[] = [];
 	// A reload loads a fresh extension instance for the same session.
@@ -57,7 +62,19 @@ test("package startup warns once per session about a missing task-model config",
 		await runner.emit({ type: "session_shutdown", reason: "quit" });
 		assert.deepEqual(errors, []);
 	}
-	assert.deepEqual(warnings, ["warning: Task model config is missing. Run /task-models to configure task routes."]);
+	return warnings;
+}
+
+test("package startup warns once per session about a missing task-model config", async (t) => {
+	assert.deepEqual(await startupWarnings(t), ["warning: Task model config is missing. Run /task-models to configure task routes."]);
+});
+
+test("package startup warns once per session about a shared unconfigured profile", async (t) => {
+	assert.deepEqual(await startupWarnings(t, JSON.stringify({ profiles: {} })), ["warning: Task model profile fast is not configured. Run /task-models."]);
+});
+
+test("package startup warns once per session about an unreadable task-model config", async (t) => {
+	assert.deepEqual(await startupWarnings(t, "{"), ["warning: Couldn't read task model config. Run /task-models."]);
 });
 
 type Kind = "select" | "confirm" | "input" | "editor" | "custom";
