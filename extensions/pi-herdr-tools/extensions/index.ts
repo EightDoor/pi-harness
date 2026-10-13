@@ -1,11 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import registerBtwExtension from "../internal/btw.ts";
+import registerBtwExtension, { BTW_TASK } from "../internal/btw.ts";
 import herdrCloneExtension from "../internal/clone-tab.ts";
 import herdrDoneExtension from "../internal/done.ts";
 import herdrHandoffExtension from "../internal/handoff.ts";
-import herdrRenameExtension from "../internal/rename.ts";
+import herdrRenameExtension, { RENAME_TASK } from "../internal/rename.ts";
+import { registerTaskModelsWarning } from "../internal/task-models.ts";
 
 export default async function herdrToolsExtension(pi: ExtensionAPI): Promise<void> {
+	registerTaskModelsWarning(pi, [RENAME_TASK, BTW_TASK]);
 	herdrRenameExtension(pi);
 	await registerBtwExtension(pi);
 	herdrCloneExtension(pi);

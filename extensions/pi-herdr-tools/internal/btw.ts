@@ -1,14 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHerdrClient, hasHerdrErrorCode, startPiAgent } from "@henryqw/pi-herdr";
-import {
-	loadTaskModelsConfig,
-	registerModelTask,
-	resolveConfiguredTaskRoutes,
-	type ModelTask,
-	type ResolvedTaskRoute,
-	type TaskRouteError,
-} from "@henryqw/pi-task-models";
+import { registerModelTask, type ModelTask, type ResolvedTaskRoute } from "@henryqw/pi-task-models";
 import {
 	buildSessionContext,
 	convertToLlm,
@@ -51,6 +44,7 @@ import {
 	type MergeRequest,
 } from "./merge.ts";
 import { HELP_TEXT, parseBtwCommand } from "./router.ts";
+import { configuredTaskRoutes } from "./task-models.ts";
 
 export const BTW_TASK = {
 	id: "pi-herdr-btw/btw",
@@ -95,21 +89,6 @@ The child shares the parent's working directory. Tool actions can change files v
 
 function sameStringArray(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((value, index) => value === b[index]);
-}
-
-function configuredBtwRoutes(ctx: ExtensionContext): ResolvedTaskRoute[] {
-	try {
-		return resolveConfiguredTaskRoutes(ctx, BTW_TASK);
-	} catch (error) {
-		const { taskRouteCode, profileName } = error as TaskRouteError;
-		throw new Error(
-			taskRouteCode === "profile-missing"
-				? `BTW task profile ${profileName} is not configured. Run /task-models.`
-				: taskRouteCode === "no-route"
-					? `BTW task profile ${profileName} has no available route. Run /task-models.`
-					: "Couldn't read task model config. Run /task-models.",
-		);
-	}
 }
 
 /**
@@ -401,7 +380,6 @@ export async function registerBtwExtension(
 		| Pick<ExtensionCommandContext, "sessionManager" | "isIdle" | "model" | "modelRegistry">
 		| undefined;
 	let sessionGeneration = 0;
-	let missingTaskModelsConfigWarningSessionId: string | undefined;
 	// Notifications need a UI context; route them through the last known ctx.
 	let notifyFn: ((message: string, type: "info" | "warning" | "error") => void) | undefined;
 	const coordinator = new MergeCoordinator(store, {
@@ -454,17 +432,6 @@ export async function registerBtwExtension(
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		const sessionId = ctx.sessionManager.getSessionId();
-		let taskModelsConfig: ReturnType<typeof loadTaskModelsConfig> | undefined;
-		try {
-			taskModelsConfig = loadTaskModelsConfig();
-		} catch {
-			ctx.ui.notify("Couldn't read task model config. Run /task-models.", "warning");
-		}
-		if (missingTaskModelsConfigWarningSessionId !== sessionId && taskModelsConfig?.source === "missing") {
-			missingTaskModelsConfigWarningSessionId = sessionId;
-			ctx.ui.notify("Task model config is missing; run /task-models to configure it.", "warning");
-		}
 		sessionGeneration += 1;
 		sessionCtx = ctx;
 		notifyFn = (message, type) => ctx.ui.notify(message, type);
@@ -599,7 +566,7 @@ export async function registerBtwExtension(
 				const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
 				const thinkingLevel = pi.getThinkingLevel();
 				let launchRoute: ResolvedTaskRoute | undefined;
-				for (const route of configuredBtwRoutes(ctx)) {
+				for (const route of configuredTaskRoutes(ctx, BTW_TASK, "BTW")) {
 					try {
 						const authenticated = (await ctx.modelRegistry.getApiKeyAndHeaders(route.model)).ok;
 						if (launchGeneration !== sessionGeneration) return;
