@@ -25,7 +25,7 @@ Left side of the third footer line for every non-empty status from extensions ou
 _Avoid_: Family extension status, rewritten status
 
 **Footer color configuration**:
-User config at `getAgentDir()/config/pi-footer/config.json` that maps footer-owned color roles to theme tokens, concrete colors, or ANSI indices. The footer reads it once per session start and never rewrites it. A missing file or missing role keeps the built-in color; an invalid file notifies once with its path and reason and the whole color config falls back to built-in colors. It does not control the thinking-level gradient or external extension status colors.
+User config at `getAgentDir()/config/pi-footer/config.json` that maps footer-owned color roles to theme tokens, concrete colors, or ANSI indices. The footer reads it once per session start and never rewrites it. A missing file or missing role keeps the built-in color; an invalid file notifies at each session start with its path and reason and the whole color config falls back to built-in colors. It does not control the thinking-level gradient or external extension status colors.
 _Avoid_: style config, theme override, per-metric styling
 
 **Open command**:

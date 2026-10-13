@@ -103,7 +103,7 @@ Package-owned: `~/.pi/agent/config/pi-footer/config.json` for footer colors and 
 | `colors` | Colors for footer-owned text by role. | Object that maps color roles to theme tokens, `#RGB`, `#RRGGBB`, `oklch(...)`, `okhsl(...)`, or an ANSI index from `0` to `255`. | Built-in colors. |
 | `command` | Command that `/open` runs. Required when the file exists. | Non-empty string. | `"code"` |
 
-The footer reads `colors` once per session start; run `/reload` after editing it. The file is never rewritten. A missing file or a missing role keeps the built-in color. An invalid file shows one notification with the path and the reason, and the whole color config falls back to the built-in colors.
+The footer reads `colors` once per session start; run `/reload` after editing it. The file is never rewritten. A missing file or a missing role keeps the built-in color. At each session start, an invalid file shows a notification with the path and the reason, and the whole color config falls back to the built-in colors.
 
 ### Footer color roles
 
@@ -145,6 +145,7 @@ Theme tokens are `accent`, `dim`, `muted`, `text`, `success`, `warning`, `error`
 ### Open command
 
 A missing file silently uses the default command, `code`. An invalid existing file makes `/open` fail visibly and stays unchanged. See Limits and recovery. `/open` reads the config on every run. Only `/set-open-in` writes the file, atomically. Reads do not create or write the config home.
+
 ## API
 
 Consumers: use the owner API. Do not read the config file directly. Replace imports from `@henryqw/pi-open-in/open-uri` with `@henryqw/pi-footer/open-uri`:

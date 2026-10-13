@@ -399,9 +399,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const runtime = paintFooter(theme, footerColors.runtime, "dim", `◷ ${formatDuration(elapsed)}`);
 					const identity = branch ? paintFooter(theme, footerColors.repository, "dim", repo) + sep(" · ") : "";
 					const checkout = branch ?? repo;
-					const linked = Boolean(openUri) && getCapabilities().hyperlinks;
-					const checkoutText = paintFooter(theme, footerColors.branch, linked ? "accent" : "dim", checkout);
-					const checkoutLink = openUri && getCapabilities().hyperlinks ? hyperlink(checkoutText, openUri) : checkoutText;
+					const linkUri = getCapabilities().hyperlinks ? openUri : undefined;
+					const checkoutText = paintFooter(theme, footerColors.branch, linkUri ? "accent" : "dim", checkout);
+					const checkoutLink = linkUri ? hyperlink(checkoutText, linkUri) : checkoutText;
 					const checkoutStatus = gitSummary.badges ? `${checkoutLink} ${paintFooter(theme, footerColors.gitStatus, "dim", gitSummary.badges)}` : checkoutLink;
 					const identityLine = prStatus ? `${identity}${checkoutStatus}${plainSep(" · ")}${prStatus}` : `${identity}${checkoutStatus}`;
 					const firstLine = quotaStatus ? align(identityLine, quotaStatus, width, ellipsis) : identityLine;
