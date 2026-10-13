@@ -342,7 +342,8 @@ function oversizedToolStart(prefix: string): EphemeralSubagentActivityEvent | un
 	}
 }
 
-function utf8Prefix(text: string, maxBytes: number): string {
+/** Longest prefix of `text` within `maxBytes` UTF-8 bytes, never splitting a code point. */
+export function utf8Prefix(text: string, maxBytes: number): string {
 	return new StringDecoder().write(Buffer.from(text).subarray(0, maxBytes));
 }
 

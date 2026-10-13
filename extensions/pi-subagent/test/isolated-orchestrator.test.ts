@@ -1283,6 +1283,31 @@ test("public recovery evidence stays bounded and omits private durable state", a
 	assert.ok(Buffer.byteLength(JSON.stringify(result.details), "utf8") < 8 * 1024);
 });
 
+test("public recovery evidence never splits a surrogate pair", async () => {
+	const state = structuredClone(PRIVATE_STATE);
+	const task = state.tasks[0]!;
+	if (task.kind !== "changeset") throw new Error("Expected a changeset task.");
+	task.attempts[0]!.preliminaryChecks!.results[0]!.stderr = `a${"🙂".repeat(1_000)}`;
+	const harness = createHarness({
+		runner: {
+			async status() {
+				return { text: "bounded recovery", state };
+			},
+		} as never,
+	});
+	const result = await executeTool(
+		namedTool(harness, "subagent_status"),
+		{ id: "request-one" },
+		new AbortController().signal,
+		context(CANONICAL_ROOT),
+	);
+	const { stderr } = (result.details as { state: { needsAttention: { failedCheck: { stderr: string } } } })
+		.state.needsAttention.failedCheck;
+	assert.doesNotMatch(stderr, /\p{Cs}/u);
+	assert.ok(stderr.endsWith("\n[truncated]"));
+	assert.ok(Buffer.byteLength(stderr.slice(0, -"\n[truncated]".length), "utf8") <= 512);
+});
+
 test("text recovery exposes only bounded text attempt evidence", async () => {
 	const taskFailure = `${"界".repeat(1_000)}UNEXPOSED_TASK_TAIL`;
 	const attemptFailure = `${"界".repeat(1_000)}UNEXPOSED_ATTEMPT_TAIL`;
