@@ -467,28 +467,22 @@ test("config subcommand updates and resets launch defaults, including malformed-
 	});
 });
 
-test("warns once per session when shared task-model config is missing", async () => {
+test("/btw reports a missing shared task-model config", async () => {
 	await withParentEnvironment(async (agentDir) => {
 		await rm(join(agentDir, "config", "pi-task-models"), { recursive: true, force: true });
-		const configStore = new FakeConfigStore();
-		configStore.source = "missing";
-		const harness = await createHarness(
-			new FakeStore(),
-			async () => ({ code: 0, stdout: "", stderr: "" }),
-			configStore,
-		);
+		const store = new FakeStore();
+		const harness = await createHarness(store, async () => ({ code: 0, stdout: "", stderr: "" }));
 		const ctx = createCommandContext();
 
-		await harness.emit("session_start", { reason: "startup" }, ctx);
-		await harness.emit("session_start", { reason: "reload" }, ctx);
+		await harness.commands.get("btw")?.handler("question", ctx);
 		harness.cleanup();
 
-		assert.deepEqual(ctx.notifications, [
-			{
-				message: "Task model config is missing; run /task-models to configure it.",
-				type: "warning",
-			},
-		]);
+		assert.equal(harness.execCalls.length, 0);
+		assert.equal(store.created.length, 0);
+		assert.deepEqual(ctx.notifications, [{
+			message: "/btw failed: Task model config is missing. Run /task-models to configure task routes.",
+			type: "error",
+		}]);
 	});
 });
 
@@ -511,10 +505,6 @@ test("unreadable task-model config does not block startup merge recovery", async
 		const ctx = createCommandContext();
 
 		await harness.emit("session_start", { reason: "startup" }, ctx);
-		assert.deepEqual(ctx.notifications, [
-			{ message: "Couldn't read task model config. Run /task-models.", type: "warning" },
-		]);
-
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		harness.cleanup();
 		assert.equal(harness.sentMessages.length, 1);

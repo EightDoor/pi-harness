@@ -412,8 +412,15 @@ function discoverModelTasks(pi: Pick<ExtensionAPI, "events">): ModelTask[] {
 	return [...tasks.values()].sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function loadTaskModelPresets(path: string): Map<string, TaskModelsConfig["profiles"]> {
-	const value: unknown = JSON.parse(readTextFileBoundedSync(path, 64 * 1024));
+function loadTaskModelPresets(path: string, options?: { missingOk: true }): Map<string, TaskModelsConfig["profiles"]> {
+	let text: string;
+	try {
+		text = readTextFileBoundedSync(path, 64 * 1024);
+	} catch (error) {
+		if (!options?.missingOk || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return new Map();
+	}
+	const value: unknown = JSON.parse(text);
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Presets must be an object.");
 	return new Map(Object.entries(value).map(([name, profiles]) => {
 		if (!isNonEmptyText(name)) throw new Error("Preset names must be non-empty text without surrounding whitespace or control characters.");
@@ -433,23 +440,26 @@ async function saveTaskModelPreset(ctx: ExtensionContext, path: string, profiles
 		return;
 	}
 	try {
+		// Confirm before locking so an open dialog never blocks other sessions' saves.
+		const replace = loadTaskModelPresets(path, { missingOk: true }).has(name);
+		if (replace && !await ctx.ui.confirm("Replace task model preset?", `Replace "${name}" with the current profiles?`)) return;
 		await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-		const release = await lock(path, { realpath: false, retries: 0 });
+		let compromised: Error | undefined;
+		const release = await lock(path, {
+			realpath: false,
+			retries: { retries: 400, factor: 1, minTimeout: 25, maxTimeout: 25 },
+			onCompromised: (error) => { compromised = error; },
+		});
 		try {
-			let presets: ReturnType<typeof loadTaskModelPresets>;
-			try {
-				presets = loadTaskModelPresets(path);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				presets = new Map();
-			}
-			if (presets.has(name) && !await ctx.ui.confirm("Replace task model preset?", `Replace "${name}" with the current profiles?`)) return;
+			const presets = loadTaskModelPresets(path, { missingOk: true });
+			if (presets.has(name) && !replace) throw new Error(`Another session saved preset "${name}"; try again.`);
 			presets.set(name, profiles);
 			const contents = `${JSON.stringify(Object.fromEntries(presets), null, 2)}\n`;
 			if (Buffer.byteLength(contents, "utf8") > 64 * 1024) throw new Error("Presets exceed 65536 bytes.");
+			if (compromised) throw compromised;
 			await writePrivateTextFileAtomically(path, contents);
 		} finally {
-			await release();
+			if (!compromised) await release();
 		}
 	} catch (error) {
 		const message = error instanceof SyntaxError ? "Invalid JSON." : error instanceof Error ? error.message : String(error);
@@ -533,9 +543,9 @@ export function createTaskModelsExtension(
 				return;
 			}
 
-			const save = async (): Promise<boolean> => {
+			const save = async (mutator: (current: TaskModelsConfig) => TaskModelsConfig): Promise<boolean> => {
 				try {
-					await configStore.save(config);
+					await configStore.update(mutator);
 					return true;
 				} catch {
 					ctx.ui.notify("Couldn't save task model config.", "error");
@@ -570,9 +580,12 @@ export function createTaskModelsExtension(
 			if (task) {
 				const profile = await ctx.ui.select(`${task.label}: ${task.purpose}`, [...PROFILE_NAMES]);
 				if (!isProfileName(profile)) return;
-				if (profile === task.defaultProfile) delete config.tasks[task.id];
-				else config.tasks[task.id] = profile;
-				if (!await save()) return;
+				if (!await save((current) => {
+					const tasks = { ...current.tasks };
+					if (profile === task.defaultProfile) delete tasks[task.id];
+					else tasks[task.id] = profile;
+					return { ...current, tasks };
+				})) return;
 				ctx.ui.notify(`${task.id} assigned to ${profile}.`, "info");
 				return;
 			}
@@ -586,9 +599,8 @@ export function createTaskModelsExtension(
 			}
 			const primary = await selectRoute(ctx, `Profile ${profile} primary`, models);
 			if (!primary) return;
-			if (profile === "fav") {
-				config.profiles[profile] = { primary };
-			} else {
+			let route: TaskModelProfile = { primary };
+			if (profile !== "fav") {
 				const fallbackModels = models.filter((model) => canonicalModelReference(model) !== primary.model);
 				const fallbackModel = await ctx.ui.select(`Profile ${profile} fallback`, [
 					"None",
@@ -600,9 +612,9 @@ export function createTaskModelsExtension(
 					: await selectThinkingLevel(ctx, `Profile ${profile} fallback`, fallbackModels, fallbackModel);
 				if (fallbackModel !== "None" && !fallback) return;
 
-				config.profiles[profile] = { primary, ...(fallback ? { fallback } : {}) };
+				if (fallback) route = { primary, fallback };
 			}
-			if (!await save()) return;
+			if (!await save((current) => ({ ...current, profiles: { ...current.profiles, [profile]: route } }))) return;
 			ctx.ui.notify(`${profile} profile saved.`, "info");
 		},
 	});

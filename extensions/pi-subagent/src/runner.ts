@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from "node:fs";
-import type { EphemeralSubagentExecutor } from "./ephemeral.ts";
+import { utf8Prefix, type EphemeralSubagentExecutor } from "./ephemeral.ts";
 import { createChildWorktree, finalizeChildWorktree, inspectWorktreeDirty, type WorktreeInfo } from "./worktree.ts";
 import type { PruneOwnership } from "./prune.ts";
 import { runGit } from "./git-process.ts";
@@ -436,10 +436,7 @@ class FollowupControl {
 
 function bounded(value: string, maxBytes = MAX_PERSISTED_RUNTIME_TEXT_BYTES): string {
 	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-	const contentBytes = maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
-	let end = Math.min(value.length, contentBytes);
-	while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > contentBytes) end -= 1;
-	return `${value.slice(0, end)}${TRUNCATION_MARKER}`;
+	return `${utf8Prefix(value, maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8"))}${TRUNCATION_MARKER}`;
 }
 
 function boundedRuntimeText(value: unknown, field: string): string {

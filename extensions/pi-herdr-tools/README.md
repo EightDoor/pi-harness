@@ -152,7 +152,7 @@ Normal cleanup does these steps. It checks whether a tab in another Herdr worksp
 - The consumer-owned `pi-herdr-btw/btw` task defaults to `fast`.
 - Before the pane starts, `/btw` selects the first authenticated viable effective profile route.
 
-`~/.pi/agent/config/pi-task-models/config.json` is shared, and `@henryqw/pi-task-models` owns it. A task entry is an explicit user override. Routes resolve before the pane starts. If this file is missing, BTW shows a warning one time per session.
+`~/.pi/agent/config/pi-task-models/config.json` is shared, and `@henryqw/pi-task-models` owns it. A task entry is an explicit user override. Routes resolve before the pane starts. If this file is missing or unreadable, or a task profile is not configured, the package shows one warning one time per session.
 
 #### Merge delivery
 
@@ -253,7 +253,7 @@ A large Main context can be more than the context limit of the side thread. Make
 
 Display titles are natural task phrases. They usually have two or three words, and they always have a maximum of four words and 20 characters. Models that answer in another language still make English display titles.
 
-If the shared task-model config is missing, the extension shows a warning one time at session start. Run `/task-models` to configure rename routing. If no route is viable, display titles do not change. `/rename` shows a warning if the session has no user text to rename.
+If the shared task-model config is missing, the package shows one warning one time per session at session start. Run `/task-models` to configure rename routing. If no route is viable, display titles do not change. `/rename` shows a warning if the session has no user text to rename.
 
 Herdr and Git synchronization failures show as warnings. Correct the reported problem. Then run `/rename` to try again. When a newer rename cancels an older rename, the extension shows no message. Older titles get no migration.
 

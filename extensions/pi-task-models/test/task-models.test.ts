@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { lock } from "proper-lockfile";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import {
 	availableTaskModels,
@@ -304,7 +305,11 @@ test("Option+S saves all current profiles, merges names, confirms replacement, a
 				return result;
 			},
 			input: async () => name,
-			confirm: async () => { confirmations++; return replace; },
+			confirm: async () => {
+				assert.equal(existsSync(`${path}.lock`), false, "must confirm before taking the preset lock");
+				confirmations++;
+				return replace;
+			},
 			notify(message: string, level: string) { notices.push([message, level]); },
 		} };
 		await handler("", ctx);
@@ -331,6 +336,44 @@ test("Option+S saves all current profiles, merges names, confirms replacement, a
 		assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { "my-setup": updated, ["__proto__"]: profiles });
 		await handler("preset", { ui: { select: async () => "__proto__", notify() {} } });
 		assert.deepEqual(loadTaskModelsConfig(dir).value.profiles, profiles);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("preset saving refuses a name another session saved after the unlocked check", async () => {
+	const dir = tempDir();
+	try {
+		const { handler } = controlPlane(eventBus(), dir);
+		mkdirSync(join(dir, "config", "pi-task-models"), { recursive: true });
+		writeFileSync(configFile(dir), JSON.stringify({ profiles: { fast: {
+			primary: { model: "provider/model", thinkingLevel: "off" },
+		} } }));
+		const path = join(dir, "config", "pi-task-models", "presets.json");
+		const other = `${JSON.stringify({ shared: { fav: { primary: { model: "provider/other", thinkingLevel: "high" } } } })}\n`;
+		const notices: Array<[string, string]> = [];
+		await handler("", { mode: "tui", ui: {
+			custom: async (factory: any) => {
+				let result: unknown;
+				factory({ requestRender() {} }, { fg: (_color: string, text: string) => text }, {}, (value: unknown) => { result = value; }).handleInput("\x1bs");
+				return result;
+			},
+			// Another session holds the lock across the unlocked check, then saves the same name.
+			input: async () => {
+				const release = await lock(path, { realpath: false });
+				setTimeout(async () => {
+					writeFileSync(path, other);
+					await release();
+				}, 50);
+				return "shared";
+			},
+			confirm: async () => assert.fail("must not confirm a name that was absent at the unlocked check"),
+			notify(message: string, level: string) { notices.push([message, level]); },
+		} });
+		assert.equal(readFileSync(path, "utf8"), other);
+		assert.equal(notices.length, 1);
+		assert.match(notices[0]![0], /Another session saved preset "shared"; try again\./);
+		assert.equal(notices[0]![1], "error");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -705,6 +748,39 @@ test("task-models stores only non-default active task assignments", async () => 
 			},
 		});
 		assert.deepEqual(loadTaskModelsConfig(dir).value.tasks, {});
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("task assignment merges into the latest config and preserves config corrupted while the picker is open", async () => {
+	const dir = tempDir();
+	try {
+		const events = eventBus();
+		const { pi, handler } = controlPlane(events, dir);
+		registerModelTask(pi as never, EXAMPLE_TASK);
+		const profiles = { fast: { primary: { model: "provider/model", thinkingLevel: "off" } } };
+		const notices: string[] = [];
+		const run = (onAssign: () => void) => handler("", { ui: {
+			select: async (_label: string, options: readonly string[]) => {
+				if (options.includes("frontier")) {
+					onAssign();
+					return "frontier";
+				}
+				return options.find((option) => option.startsWith(EXAMPLE_TASK.label));
+			},
+			notify(message: string) { notices.push(message); },
+		} });
+
+		await run(() => {
+			mkdirSync(join(dir, "config", "pi-task-models"), { recursive: true });
+			writeFileSync(configFile(dir), JSON.stringify({ profiles, tasks: { "pi-other/task": "fav" } }));
+		});
+		assert.deepEqual(loadTaskModelsConfig(dir).value, { profiles, tasks: { "pi-other/task": "fav", [EXAMPLE_TASK.id]: "frontier" } });
+
+		await run(() => writeFileSync(configFile(dir), "{ not json"));
+		assert.equal(readFileSync(configFile(dir), "utf8"), "{ not json");
+		assert.equal(notices.pop(), "Couldn't save task model config.");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

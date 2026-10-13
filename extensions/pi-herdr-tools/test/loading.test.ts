@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,56 @@ test("package loading registers all Herdr commands through one extension", async
 		loaded.extensions.flatMap((extension) => [...extension.commands.keys()]).sort(),
 		["btw", "clone-tab", "clone-worktree", "done", "rename"],
 	);
+});
+
+/** Start and reload the package once per session; return its notifications. */
+async function startupWarnings(t: TestContext, config?: string): Promise<string[]> {
+	const isolated = await mkdtemp(join(tmpdir(), "pi-herdr-tools-task-models-"));
+	const previous = { agentDir: process.env.PI_CODING_AGENT_DIR, tmp: process.env.TMPDIR };
+	process.env.PI_CODING_AGENT_DIR = isolated;
+	process.env.TMPDIR = isolated;
+	t.after(async () => {
+		for (const [key, value] of [["PI_CODING_AGENT_DIR", previous.agentDir], ["TMPDIR", previous.tmp]] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		await rm(isolated, { recursive: true, force: true });
+	});
+	if (config !== undefined) {
+		await mkdir(join(isolated, "config", "pi-task-models"), { recursive: true });
+		await writeFile(join(isolated, "config", "pi-task-models", "config.json"), config);
+	}
+	const sessionManager = SessionManager.inMemory(isolated);
+	const warnings: string[] = [];
+	// A reload loads a fresh extension instance for the same session.
+	for (const reason of ["startup", "reload"] as const) {
+		const loaded = await discoverAndLoadExtensions([packageRoot], isolated, isolated);
+		assert.deepEqual(loaded.errors, []);
+		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, isolated, sessionManager, undefined as never);
+		const errors: string[] = [];
+		runner.onError((error) => errors.push(error.error));
+		runner.bindCore({ getSessionName: () => undefined } as never, {} as never);
+		runner.setUIContext({
+			notify: (message: string, type?: string) => warnings.push(`${type}: ${message}`),
+			setWidget() {}, setStatus() {},
+		} as unknown as ExtensionUIContext, "tui");
+		await runner.emit({ type: "session_start", reason });
+		await runner.emit({ type: "session_shutdown", reason: "quit" });
+		assert.deepEqual(errors, []);
+	}
+	return warnings;
+}
+
+test("package startup warns once per session about a missing task-model config", async (t) => {
+	assert.deepEqual(await startupWarnings(t), ["warning: Task model config is missing. Run /task-models to configure task routes."]);
+});
+
+test("package startup warns once per session about a shared unconfigured profile", async (t) => {
+	assert.deepEqual(await startupWarnings(t, JSON.stringify({ profiles: {} })), ["warning: Task model profile fast is not configured. Run /task-models."]);
+});
+
+test("package startup warns once per session about an unreadable task-model config", async (t) => {
+	assert.deepEqual(await startupWarnings(t, "{"), ["warning: Couldn't read task model config. Run /task-models."]);
 });
 
 type Kind = "select" | "confirm" | "input" | "editor" | "custom";

@@ -1328,6 +1328,18 @@ test("a blocked diagnostic is normalized before same-worker correction", async (
 	assertParsed(result.state);
 });
 
+test("a truncated diagnostic never splits a surrogate pair", async (t) => {
+	const { root, runtime, runner } = await harness(t);
+	runtime.workerResults.push({ outcome: "blocked", diagnostic: `a${"🙂".repeat(3_000)}` });
+
+	const result = await runner.execute(request("surrogate-diagnostic", [changesetTask("change")]), root);
+	const failure = changesetState(result.state, "change").attempts[0]!.prompts[0]!.failure!;
+
+	assert.doesNotMatch(failure, /\p{Cs}/u);
+	assert.ok(failure.endsWith("\n[truncated]"));
+	assert.ok(Buffer.byteLength(failure, "utf8") <= MAX_PERSISTED_RUNTIME_TEXT_BYTES);
+});
+
 test("a dirty finished turn gets one commit nudge without consuming its correction", async (t) => {
 	const { root, runtime, runner, store } = await harness(t);
 	runtime.workerResults.push({ outcome: "uncommitted", diagnostic: "dirty" });

@@ -444,6 +444,9 @@ function validateMutation(mutation: MemoryMutation): ValidatedMutation {
 	if (bytes > MAX_FILE_BYTES) {
 		throw new Error(`Complete serialized memory mutation is ${bytes.toLocaleString()} UTF-8 bytes; the limit is ${MAX_FILE_BYTES.toLocaleString()} bytes.`);
 	}
+	if (mutation.operations !== undefined && (mutation.action !== undefined || mutation.content !== undefined || mutation.old_text !== undefined)) {
+		throw new Error("Use either operations or top-level action/content/old_text, not both.");
+	}
 	if (mutation.operations !== undefined && mutation.operations.length > MAX_BATCH_OPERATIONS) {
 		throw new Error(`operations cannot contain more than ${MAX_BATCH_OPERATIONS} items.`);
 	}
@@ -979,7 +982,7 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 				content: Type.Optional(Type.String()),
 				old_text: Type.Optional(Type.String()),
 			}), { description: "Preferred atomic batch of memory changes.", maxItems: MAX_BATCH_OPERATIONS })),
-		}),
+		}, { additionalProperties: false }),
 		executionMode: "sequential",
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx: ExtensionContext, expectedGeneration = state.sessionGeneration) {
@@ -988,16 +991,17 @@ export default function memoryExtension(pi: ExtensionAPI): void {
 			if (!state.config || !state.stores) throw new Error("Memory extension is not initialized.");
 			const target = args.target ?? "memory";
 			const store = state.stores[target];
-			const mutation: MemoryMutation = args.operations === undefined
-				? { target, action: args.action, content: args.content, old_text: args.old_text }
-				: {
-					target,
-					operations: args.operations.map((operation) => ({
-						action: operation.action,
-						content: operation.content,
-						old_text: operation.old_text,
-					})),
-				};
+			const mutation: MemoryMutation = {
+				target,
+				action: args.action,
+				content: args.content,
+				old_text: args.old_text,
+				operations: args.operations?.map((operation) => ({
+					action: operation.action,
+					content: operation.content,
+					old_text: operation.old_text,
+				})),
+			};
 			const validated = validateMutation(mutation);
 			const needsReview = validated.kind === "single"
 				? validated.operation.action === "add"

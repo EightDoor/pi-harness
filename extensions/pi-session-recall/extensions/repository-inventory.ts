@@ -203,14 +203,11 @@ function runGit(
 }
 
 function decodeUtf8(value: Buffer, error: () => Error): string {
-	let decoded: string;
 	try {
-		decoded = new TextDecoder("utf-8", { fatal: true }).decode(value);
+		return new TextDecoder("utf-8", { fatal: true }).decode(value);
 	} catch {
 		throw error();
 	}
-	if (decoded.includes("�")) throw error();
-	return decoded;
 }
 
 function decodeAscii(value: Buffer, error: () => Error): string {

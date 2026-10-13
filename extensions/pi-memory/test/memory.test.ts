@@ -46,7 +46,7 @@ type CapturedTool = {
 	description: string;
 	executionMode?: "sequential" | "parallel";
 	exposure?: string;
-	parameters?: { properties?: { operations?: { maxItems?: number } } };
+	parameters?: Record<string, unknown> & { properties?: { operations?: { maxItems?: number } } };
 	execute(
 		toolCallId: string,
 		params: Record<string, unknown>,
@@ -683,6 +683,15 @@ test("extension loads a frozen snapshot, dispatches writes, caps retries, and sk
 		assert.equal(memoryTool.executionMode, "sequential");
 		assert.equal(memoryTool.exposure, "model-only");
 		assert.equal(memoryTool.parameters?.properties?.operations?.maxItems, MAX_BATCH_OPERATIONS);
+		assert.equal(memoryTool.parameters?.type, "object");
+		assert.equal(memoryTool.parameters?.additionalProperties, false);
+		assert.ok(memoryTool.parameters?.properties);
+		assert.ok(!("anyOf" in memoryTool.parameters!) && !("oneOf" in memoryTool.parameters!));
+		await assert.rejects(
+			() => memoryTool.execute("mixed", { action: "add", content: "dropped", operations: [{ action: "add", content: "kept" }] }),
+			/Use either operations or top-level action\/content\/old_text, not both/,
+		);
+		assert.equal(await readFile(join(memoryDir, "MEMORY.md"), "utf8"), "stable fact");
 
 		const injected = promptEvent();
 		assert.equal(await before(injected), undefined);
