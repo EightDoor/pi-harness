@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +8,16 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getCapabilities, setCapabilities, stripTerminalSequences } from "@earendil-works/pi-tui";
 import footerExtension from "../extensions/footer.ts";
 
+
+// Isolate footer color config so a developer's real agent directory cannot change render output.
+const isolatedAgentDir = mkdtempSync(join(tmpdir(), "pi-footer-agent-"));
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = isolatedAgentDir;
+process.on("exit", () => {
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	rmSync(isolatedAgentDir, { recursive: true, force: true });
+});
 const usage = (input: number, output: number, cacheRead: number, cost: number) => ({
 	input,
 	output,

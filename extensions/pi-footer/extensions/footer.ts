@@ -3,6 +3,7 @@ import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { getCapabilities, hyperlink, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { configuredOpenUri } from "./open.ts";
+import { type FooterColorConfig, footerConfigPath, loadFooterConfig, paintFooter } from "./footer-config.ts";
 
 const THINKING_COLORS = {
 	minimal: 46,
@@ -326,6 +327,14 @@ export default function footerExtension(pi: ExtensionAPI): void {
 			}
 		};
 
+		// Colors are read once per session start; /reload applies edits
+		let footerColors: FooterColorConfig = {};
+		try {
+			footerColors = loadFooterConfig();
+		} catch (error) {
+			ctx.ui.notify(`Footer colors ignored (${footerConfigPath()}): ${(error as Error).message}`, "error");
+		}
+
 		ctx.ui.setFooter((tui, theme, data) => {
 			requestRuntimeRender = () => tui.requestRender();
 			const unsubscribe = data.onBranchChange(() => {
@@ -355,7 +364,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
 					const extensionStatuses = data.getExtensionStatuses();
 					const prStatus = sanitizeStatus(extensionStatuses.get("pi-pr") ?? "");
 					const codegraph = activeCodegraphCalls.size > 0
-						? `${theme.fg("accent", "●")} CG`
+						? `${paintFooter(theme, footerColors.codegraphActive, "accent", "●")} CG`
 						: sanitizeStatus(extensionStatuses.get("pi-codegraph") ?? "");
 					const quotaStatus = sanitizeStatus(extensionStatuses.get(QUOTA_STATUS_KEY) ?? "");
 					const externalStatuses: string[] = [];
@@ -364,38 +373,42 @@ export default function footerExtension(pi: ExtensionAPI): void {
 						const text = sanitizeStatus(value);
 						if (text) externalStatuses.push(text);
 					}
-					const ellipsis = theme.fg("dim", "…");
-					const usage = theme.fg("dim", [
-						`↑ ${formatTokens(input)}`,
-						`↓ ${formatTokens(output)}`,
-						`↺ ${cacheRate === undefined ? "—" : `${cacheRate.toFixed(1)}%`}`,
-						`⚡ ${tps === undefined ? "—" : `${tps.toFixed(1)} t/s`}`,
-					`$ ${cost.toFixed(3)}`,
-						`◔ ${context == null ? "—" : `${context.toFixed(1)}%`}`,
-					].join(" · "));
+					const sep = (text: string) => paintFooter(theme, footerColors.separator, "dim", text);
+					// Previously uncolored joins only take the separator color when it is configured, keeping the default look
+					const plainSep = (text: string) =>
+						footerColors.separator === undefined ? text : paintFooter(theme, footerColors.separator, "dim", text);
+					const ellipsis = sep("…");
+					const usage = [
+						paintFooter(theme, footerColors.input, "dim", `↑ ${formatTokens(input)}`),
+						paintFooter(theme, footerColors.output, "dim", `↓ ${formatTokens(output)}`),
+						paintFooter(theme, footerColors.cache, "dim", `↺ ${cacheRate === undefined ? "—" : `${cacheRate.toFixed(1)}%`}`),
+						paintFooter(theme, footerColors.throughput, "dim", `⚡ ${tps === undefined ? "—" : `${tps.toFixed(1)} t/s`}`),
+						paintFooter(theme, footerColors.cost, "dim", `$ ${cost.toFixed(3)}`),
+						paintFooter(theme, footerColors.context, "dim", `◔ ${context == null ? "—" : `${context.toFixed(1)}%`}`),
+					].join(sep(" · "));
 					const thinkingText = (level: string) => {
 						const thinkingColor = THINKING_COLORS[level as keyof typeof THINKING_COLORS];
 						return level === "ultra" ? rainbow(level) : thinkingColor === undefined ? theme.fg("dim", level) : color(level, thinkingColor);
 					};
-					const selected = theme.fg("dim", `${ctx.model?.id ?? "no-model"} • `) + thinkingText(String(ctx.thinkingLevel ?? "off"));
+					const selected = paintFooter(theme, footerColors.model, "dim", `${ctx.model?.id ?? "no-model"}`) + sep(" • ") + thinkingText(String(ctx.thinkingLevel ?? "off"));
 					// Under a virtual selection, show where the latest request went, as Pi's own footer does.
 					const model = ctx.model?.api === VIRTUAL_MODEL_API && routed
-						? selected + theme.fg("dim", ` → ${routed.model}`) + (routed.thinkingLevel ? theme.fg("dim", " • ") + thinkingText(routed.thinkingLevel) : "")
+						? selected + sep(" → ") + paintFooter(theme, footerColors.model, "dim", routed.model) + (routed.thinkingLevel ? sep(" • ") + thinkingText(routed.thinkingLevel) : "")
 						: selected;
 					const elapsed = activeMilliseconds + (activeStartedAt === undefined ? 0 : performance.now() - activeStartedAt);
-					const runtime = theme.fg("dim", `◷ ${formatDuration(elapsed)}`);
-					const identity = branch ? theme.fg("dim", `${repo} · `) : "";
+					const runtime = paintFooter(theme, footerColors.runtime, "dim", `◷ ${formatDuration(elapsed)}`);
+					const identity = branch ? paintFooter(theme, footerColors.repository, "dim", repo) + sep(" · ") : "";
 					const checkout = branch ?? repo;
-					const checkoutLink = openUri && getCapabilities().hyperlinks
-						? hyperlink(theme.fg("accent", checkout), openUri)
-						: theme.fg("dim", checkout);
-					const checkoutStatus = gitSummary.badges ? `${checkoutLink} ${theme.fg("dim", gitSummary.badges)}` : checkoutLink;
-					const identityLine = prStatus ? `${identity}${checkoutStatus} · ${prStatus}` : `${identity}${checkoutStatus}`;
+					const linked = Boolean(openUri) && getCapabilities().hyperlinks;
+					const checkoutText = paintFooter(theme, footerColors.branch, linked ? "accent" : "dim", checkout);
+					const checkoutLink = openUri && getCapabilities().hyperlinks ? hyperlink(checkoutText, openUri) : checkoutText;
+					const checkoutStatus = gitSummary.badges ? `${checkoutLink} ${paintFooter(theme, footerColors.gitStatus, "dim", gitSummary.badges)}` : checkoutLink;
+					const identityLine = prStatus ? `${identity}${checkoutStatus}${plainSep(" · ")}${prStatus}` : `${identity}${checkoutStatus}`;
 					const firstLine = quotaStatus ? align(identityLine, quotaStatus, width, ellipsis) : identityLine;
 					const lines = [
 						firstLine,
 						align(usage, model, width, ellipsis),
-						alignRightReserved([codegraph, ...externalStatuses].filter(Boolean).join(" · "), runtime, width, ellipsis),
+						alignRightReserved([codegraph, ...externalStatuses].filter(Boolean).join(plainSep(" · ")), runtime, width, ellipsis),
 					];
 					return lines.map((line) => truncateToWidth(line, width, ellipsis));
 				},
