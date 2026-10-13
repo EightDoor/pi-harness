@@ -121,6 +121,21 @@ test("feedback reads paginate every connection and enforce page and record bound
 	await assert.rejects(collectPullRequestFeedback(authority(), { exec: tooMany, cwd: process.cwd() }), /exceeds 1000 records/);
 });
 
+test("feedback reads retry only on transient gh stderr, not on argv text", async () => {
+	const pr503 = { ...authority(), number: 503, url: "https://github.com/acme/project/pull/503" };
+	const read = async (stderr: string) => {
+		let calls = 0;
+		const exec: Exec = async () => {
+			calls += 1;
+			return result("", 1, stderr);
+		};
+		await assert.rejects(collectPullRequestFeedback(pr503, { exec, cwd: process.cwd(), pause: async () => {} }));
+		return calls;
+	};
+	assert.equal(await read("gh: Not Found (HTTP 404)"), 1);
+	assert.equal(await read("gh: Bad Gateway (HTTP 502)"), 3);
+});
+
 type Fixture = {
 	root: string;
 	bare: string;

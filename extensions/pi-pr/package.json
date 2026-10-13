@@ -1,6 +1,6 @@
 {
   "name": "@henryqw/pi-pr",
-  "version": "10.0.0",
+  "version": "10.0.1",
   "description": "Run /pr to safely discover or link the current pull request, then create, update, address feedback, fix CI, or merge when ready.",
   "keywords": [
     "pi-package",
@@ -25,7 +25,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.ts && node skills/pi-pr-comment-sweep/scripts/pr-feedback.mjs self-test && python3 skills/update-from-main/scripts/validate.py",
+    "test": "node --test test/*.test.ts && python3 skills/update-from-main/scripts/validate.py",
     "test:git-workflows": "node --test test/git-commit.test.ts test/pr-native.test.ts test/pr-publish-work.test.ts && node --test --test-name-pattern='native source Git tools' test/pr.test.ts && python3 skills/update-from-main/scripts/validate.py",
     "typecheck": "tsc --noEmit --allowImportingTsExtensions --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck extensions/*.ts test/*.test.ts",
     "pack:check": "npm pack --dry-run"

@@ -271,19 +271,6 @@ export function parseFeedbackSnapshot(value: unknown): FeedbackSnapshot {
 	return snapshot;
 }
 
-export function parseFeedbackSnapshotText(raw: string): FeedbackSnapshot {
-	if (Buffer.byteLength(raw, "utf8") > FEEDBACK_SNAPSHOT_MAX_BYTES) {
-		throw new Error(`feedback snapshot exceeds ${FEEDBACK_SNAPSHOT_MAX_BYTES} bytes`);
-	}
-	let value: unknown;
-	try {
-		value = JSON.parse(raw);
-	} catch {
-		throw new Error("feedback snapshot contains invalid JSON");
-	}
-	return parseFeedbackSnapshot(value);
-}
-
 export function feedbackEntries(snapshotInput: FeedbackSnapshot): FeedbackEntry[] {
 	const snapshot = snapshotInput;
 	const entries: FeedbackEntry[] = [];
@@ -357,8 +344,9 @@ function connection(value: unknown, label: string): Connection {
 	return { nodes: value.nodes, hasNextPage, endCursor: typeof endCursor === "string" ? endCursor : null };
 }
 
-function transient(error: unknown): boolean {
-	return /\b5\d\d\b|tls|ssl|x509|certificate|handshake/i.test(error instanceof Error ? error.message : String(error));
+// Classify only failed gh stderr; argv carries PR numbers and repository names.
+function transient(stderr: string): boolean {
+	return /\bHTTP 5\d\d\b|\b(?:tls|x509):|\bTLS handshake\b/i.test(stderr);
 }
 
 class FeedbackClient {
@@ -384,10 +372,15 @@ class FeedbackClient {
 			if (value !== null) args.push(typeof value === "number" ? "-F" : "-f", `${name}=${value}`);
 		}
 		for (let attempt = 0; ; attempt += 1) {
+			let failure = "";
 			try {
 				this.pages += 1;
 				if (this.pages > FEEDBACK_MAX_PAGES) throw new Error(`feedback pagination exceeds ${FEEDBACK_MAX_PAGES} pages`);
-				const result = await runChecked(this.options.exec, "gh", args, this.execOptions(query));
+				const result = await runChecked(async (command, commandArgs, options) => {
+					const output = await this.options.exec(command, commandArgs, options);
+					if (!output.killed && output.code !== 0) failure = output.stderr;
+					return output;
+				}, "gh", args, this.execOptions(query));
 				let value: unknown;
 				try {
 					value = JSON.parse(result.stdout);
@@ -401,7 +394,7 @@ class FeedbackClient {
 				if (!isRecord(value.data)) throw new Error("GitHub GraphQL response has no data");
 				return value.data;
 			} catch (error) {
-				if (!readOnly || attempt === READ_ATTEMPTS - 1 || !transient(error)) throw error;
+				if (!readOnly || attempt === READ_ATTEMPTS - 1 || !transient(failure)) throw error;
 				await (this.options.pause ?? sleep)(250 * (attempt + 1));
 			}
 		}
