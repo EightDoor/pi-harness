@@ -2,7 +2,7 @@ import { basename } from "node:path";
 import type { JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import type { EphemeralSubagentExecutor } from "../dist/ephemeral.js";
+import { utf8Prefix, type EphemeralSubagentExecutor } from "../dist/ephemeral.js";
 import type { EffectiveExecutionPolicy } from "./config.ts";
 import {
 	createCanonicalGitRootResolver,
@@ -196,9 +196,7 @@ function boundedReport(lines: readonly string[], omitted: string): string {
 
 function boundedPublicText(value: string, maxBytes = PUBLIC_EVIDENCE_MAX_BYTES): string {
 	if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-	let end = Math.min(value.length, maxBytes);
-	while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maxBytes) end -= 1;
-	return `${value.slice(0, end)}\n[truncated]`;
+	return `${utf8Prefix(value, maxBytes)}\n[truncated]`;
 }
 
 function publicFailedCheck(evidence: CheckBatchEvidence | undefined) {
