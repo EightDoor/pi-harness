@@ -57,6 +57,7 @@ type HarnessOptions = {
 	fetchUrlResult?: ReturnType<typeof result>;
 	pushRepositoryResult?: ReturnType<typeof result>;
 	remoteHead?: string | null;
+	githubHostsResult?: ReturnType<typeof result>;
 	remoteHeads?: Record<string, string | null>;
 	configValues?: Record<string, string[]>;
 	remoteHeadResult?: ReturnType<typeof result>;
@@ -297,6 +298,9 @@ function harness(options: HarnessOptions = {}) {
 					? defaultUrl
 					: options.fetchUrls?.[requestedRemote] ?? (requestedRemote === remote ? options.fetchUrl : undefined) ?? defaultUrl;
 				return result(`${requestedUrl}\n`);
+			}
+			if (command === "gh" && args[0] === "auth" && args[1] === "status") {
+				return options.githubHostsResult ?? result(JSON.stringify({ hosts: { "github.com": [] } }));
 			}
 			if (command === "gh" && args[0] === "repo" && args[1] === "view") {
 				const [host, owner, name, ...rest] = (args[2] ?? "").split("/");
@@ -798,6 +802,8 @@ test("stays inactive only after a C-locale safe-directory probe confirms no repo
 		if (command === "git" && args.join(" ") === "rev-parse --is-inside-work-tree") {
 			return result("", 128, "fatal: kein Git-Repository");
 		}
+		// 入口的 remote URL 探测在非仓库目录同样读不到任何 remote
+		if (command === "git" && args[0] === "config") return result("", 1);
 		if (command === "env") {
 			assert.deepEqual(args, [
 				"LC_ALL=C",
@@ -816,6 +822,45 @@ test("stays inactive only after a C-locale safe-directory probe confirms no repo
 
 	assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive" });
 	assert.equal(calls.some(({ args }) => args[0] === "branch"), false);
+});
+
+test("treats a repository with no GitHub-hosted remote as inactive", async () => {
+	for (const url of [
+		"ssh://git@192.168.192.3:9005/windows-config-sync/pi-settings.git",
+		"git@gitlab.internal.example:team/project.git",
+	]) {
+		const { pi, context, calls } = harness({
+			configResults: { "^remote\\..*\\.(url|pushurl)$": result(`remote.origin.url ${url}\n`) },
+			githubHostsResult: result(JSON.stringify({ hosts: { "github.com": [] } })),
+		});
+		assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive" }, url);
+		// inactive 时不应触发任何 PR 发现或 gh 仓库查询
+		assert.equal(
+			calls.some(({ command, args }) => command === "gh" && (args[0] === "repo" || args[0] === "api" || args[0] === "pr")),
+			false,
+			url,
+		);
+		assert.equal(calls.some(({ command, args }) => command === "git" && args[0] === "branch"), false, url);
+	}
+});
+
+test("keeps GitHub and GitHub Enterprise remotes on the normal discovery path", async () => {
+	const cases: { name: string; url: string; hosts: string }[] = [
+		{ name: "github.com", url: "git@github.com:acme/fork.git", hosts: JSON.stringify({ hosts: { "github.com": [] } }) },
+		{
+			name: "GitHub Enterprise",
+			url: "ssh://git@ghe.example.com/acme/fork.git",
+			hosts: JSON.stringify({ hosts: { "ghe.example.com": [] } }),
+		},
+	];
+	for (const { name, url, hosts } of cases) {
+		const app = harness({
+			configResults: { "^remote\\..*\\.(url|pushurl)$": result(`remote.fork.url ${url}\n`) },
+			githubHostsResult: result(hosts),
+		});
+		const discovery = await discoverCurrentPullRequest(app.pi, app.context);
+		assert.equal(discovery.kind, "current", name);
+	}
 });
 
 test("surfaces repository errors and a later read recovers after the error is fixed", async () => {
@@ -1140,7 +1185,9 @@ test("rediscovers an unpublished branch before link configuration or creation pr
 	const remoteReadIndexes = app.calls.flatMap(({ command, args }, index) =>
 		command === "git" && args[0] === "ls-remote" ? [index] : []
 	);
-	const firstConfigIndex = app.calls.findIndex(({ command, args }) => command === "git" && args[0] === "config");
+	const firstConfigIndex = app.calls.findIndex(({ command, args }) =>
+		command === "git" && args[0] === "config" && args[1] === "--get-all"
+	);
 	assert.equal(remoteReads, 2);
 	assert.equal(remoteReadIndexes.length, 2);
 	assert.ok(firstConfigIndex > remoteReadIndexes[1]!);

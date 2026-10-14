@@ -1773,7 +1773,45 @@ export async function loadCurrentPullRequest(
 	inspectedLocal?: LocalMergeSafety,
 	observed?: unknown,
 ): Promise<CurrentPullRequestDiscovery> {
+	// 非 GitHub 托管的 remote（内网 Git 等）不属于 PR 工作流，归为 inactive 而不是报错
+	if (await isNonGitHubRepository(pi, context)) return { kind: "inactive" };
 	return await loadCurrentPullRequestInternal(pi, context, inspectedLocal, observed);
+}
+
+// shortcut: 仅在 remote URL 无空格时可靠；git 对含特殊字符的 URL 会加引号，届时交回原流程报错
+async function isNonGitHubRepository(
+	pi: Pick<ExtensionAPI, "exec">,
+	context: PullRequestLoadContext,
+): Promise<boolean> {
+	const result = await invoke(pi, context, "Read remote URLs", "git", [
+		"config", "--get-regexp", "^remote\\..*\\.(url|pushurl)$",
+	]);
+	if (result.code !== 0) return false;
+	const hosts: string[] = [];
+	for (const line of result.stdout.replace(/\r\n/g, "\n").split("\n")) {
+		const separator = line.indexOf(" ");
+		if (separator === -1) continue;
+		const value = line.slice(separator + 1);
+		let host = "";
+		try {
+			host = new URL(value).hostname;
+		} catch {
+			// scp 形式（git@host:owner/repo.git）不是合法 URL
+			host = /^(?:[^@/]+@)?([^:/]+):/.exec(value)?.[1] ?? "";
+		}
+		if (host) hosts.push(host.toLowerCase());
+	}
+	if (hosts.length === 0 || hosts.includes("github.com")) return false;
+	// 其余主机需为 gh 已配置的主机（GitHub Enterprise）
+	const known = await invoke(pi, context, "Read GitHub hosts", "gh", ["auth", "status", "--json", "hosts"]);
+	if (known.code !== 0) return true;
+	try {
+		const parsed: unknown = JSON.parse(known.stdout.replace(/\r\n/g, "\n"));
+		const configured = Object.keys(isRecord(parsed) && isRecord(parsed.hosts) ? parsed.hosts : {});
+		return !hosts.some((host) => configured.includes(host));
+	} catch {
+		return true;
+	}
 }
 
 async function loadCurrentPullRequestInternal(
