@@ -834,7 +834,7 @@ test("treats a repository with no GitHub-hosted remote as inactive", async () =>
 			githubHostsResult: result(JSON.stringify({ hosts: { "github.com": [] } })),
 		});
 		assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive" }, url);
-		// inactive 时不应触发任何 PR 发现或 gh 仓库查询
+		// inactivity must not trigger pull request discovery or any gh repository query
 		assert.equal(
 			calls.some(({ command, args }) => command === "gh" && (args[0] === "repo" || args[0] === "api" || args[0] === "pr")),
 			false,
