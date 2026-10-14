@@ -1773,12 +1773,12 @@ export async function loadCurrentPullRequest(
 	inspectedLocal?: LocalMergeSafety,
 	observed?: unknown,
 ): Promise<CurrentPullRequestDiscovery> {
-	// 非 GitHub 托管的 remote（内网 Git 等）不属于 PR 工作流，归为 inactive 而不是报错
+	// A repository whose remote is not GitHub-hosted has no pull request workflow; stay inactive instead of failing
 	if (await isNonGitHubRepository(pi, context)) return { kind: "inactive" };
 	return await loadCurrentPullRequestInternal(pi, context, inspectedLocal, observed);
 }
 
-// shortcut: 仅在 remote URL 无空格时可靠；git 对含特殊字符的 URL 会加引号，届时交回原流程报错
+// shortcut: only reliable while remote URLs contain no spaces; git quotes URLs with special characters, and those fall back to the previous failure path
 async function isNonGitHubRepository(
 	pi: Pick<ExtensionAPI, "exec">,
 	context: PullRequestLoadContext,
@@ -1796,13 +1796,13 @@ async function isNonGitHubRepository(
 		try {
 			host = new URL(value).hostname;
 		} catch {
-			// scp 形式（git@host:owner/repo.git）不是合法 URL
+			// scp syntax (git@host:owner/repo.git) is not a valid URL
 			host = /^(?:[^@/]+@)?([^:/]+):/.exec(value)?.[1] ?? "";
 		}
 		if (host) hosts.push(host.toLowerCase());
 	}
 	if (hosts.length === 0 || hosts.includes("github.com")) return false;
-	// 其余主机需为 gh 已配置的主机（GitHub Enterprise）
+	// any other host must be one gh knows about, such as a GitHub Enterprise host
 	const known = await invoke(pi, context, "Read GitHub hosts", "gh", ["auth", "status", "--json", "hosts"]);
 	if (known.code !== 0) return true;
 	try {

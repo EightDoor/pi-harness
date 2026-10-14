@@ -802,7 +802,7 @@ test("stays inactive only after a C-locale safe-directory probe confirms no repo
 		if (command === "git" && args.join(" ") === "rev-parse --is-inside-work-tree") {
 			return result("", 128, "fatal: kein Git-Repository");
 		}
-		// 入口的 remote URL 探测在非仓库目录同样读不到任何 remote
+		// the entry guard reads remote URLs, which are absent outside a repository too
 		if (command === "git" && args[0] === "config") return result("", 1);
 		if (command === "env") {
 			assert.deepEqual(args, [
