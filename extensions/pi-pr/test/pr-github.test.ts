@@ -57,7 +57,8 @@ type HarnessOptions = {
 	fetchUrlResult?: ReturnType<typeof result>;
 	pushRepositoryResult?: ReturnType<typeof result>;
 	remoteHead?: string | null;
-	githubHostsResult?: ReturnType<typeof result>;
+	remoteListResult?: ReturnType<typeof result>;
+	githubHosts?: string[];
 	remoteHeads?: Record<string, string | null>;
 	configValues?: Record<string, string[]>;
 	remoteHeadResult?: ReturnType<typeof result>;
@@ -299,8 +300,17 @@ function harness(options: HarnessOptions = {}) {
 					: options.fetchUrls?.[requestedRemote] ?? (requestedRemote === remote ? options.fetchUrl : undefined) ?? defaultUrl;
 				return result(`${requestedUrl}\n`);
 			}
-			if (command === "gh" && args[0] === "auth" && args[1] === "status") {
-				return options.githubHostsResult ?? result(JSON.stringify({ hosts: { "github.com": [] } }));
+			if (command === "git" && args.join(" ") === "remote -v") {
+				if (options.remoteListResult) return options.remoteListResult;
+				return result((options.remoteNames ?? [remote, "origin"]).map((name) => {
+					const url = options.pushUrls?.[name] ?? (name === remote ? pushUrl : `git@github.com:acme/${name}.git`);
+					return `${name}\t${url} (fetch)\n${name}\t${url} (push)\n`;
+				}).join(""));
+			}
+			if (command === "gh" && args.slice(0, 3).join(" ") === "auth token --hostname") {
+				return (options.githubHosts ?? ["github.com"]).includes(args[3] ?? "")
+					? result("token\n")
+					: result("", 1, `no oauth token found for ${args[3]}\n`);
 			}
 			if (command === "gh" && args[0] === "repo" && args[1] === "view") {
 				const [host, owner, name, ...rest] = (args[2] ?? "").split("/");
@@ -802,8 +812,6 @@ test("stays inactive only after a C-locale safe-directory probe confirms no repo
 		if (command === "git" && args.join(" ") === "rev-parse --is-inside-work-tree") {
 			return result("", 128, "fatal: kein Git-Repository");
 		}
-		// the entry guard reads remote URLs, which are absent outside a repository too
-		if (command === "git" && args[0] === "config") return result("", 1);
 		if (command === "env") {
 			assert.deepEqual(args, [
 				"LC_ALL=C",
@@ -826,40 +834,28 @@ test("stays inactive only after a C-locale safe-directory probe confirms no repo
 
 test("treats a repository with no GitHub-hosted remote as inactive", async () => {
 	for (const url of [
-		"ssh://git@192.168.192.3:9005/windows-config-sync/pi-settings.git",
+		"ssh://git@192.168.192.3:9005/team/project.git",
 		"git@gitlab.internal.example:team/project.git",
 	]) {
-		const { pi, context, calls } = harness({
-			configResults: { "^remote\\..*\\.(url|pushurl)$": result(`remote.origin.url ${url}\n`) },
-			githubHostsResult: result(JSON.stringify({ hosts: { "github.com": [] } })),
-		});
-		assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive" }, url);
-		// inactivity must not trigger pull request discovery or any gh repository query
-		assert.equal(
-			calls.some(({ command, args }) => command === "gh" && (args[0] === "repo" || args[0] === "api" || args[0] === "pr")),
-			false,
-			url,
-		);
+		const { pi, context, calls } = harness({ remoteListResult: result(`origin\t${url} (fetch)\norigin\t${url} (push)\n`) });
+		const host = url.startsWith("ssh:") ? "192.168.192.3" : "gitlab.internal.example";
+		assert.deepEqual(await discoverCurrentPullRequest(pi, context), { kind: "inactive", nonGitHubHosts: [host] }, url);
+		assert.equal(calls.some(({ command, args }) => command === "gh" && args[0] !== "auth"), false, url);
 		assert.equal(calls.some(({ command, args }) => command === "git" && args[0] === "branch"), false, url);
 	}
 });
 
 test("keeps GitHub and GitHub Enterprise remotes on the normal discovery path", async () => {
-	const cases: { name: string; url: string; hosts: string }[] = [
-		{ name: "github.com", url: "git@github.com:acme/fork.git", hosts: JSON.stringify({ hosts: { "github.com": [] } }) },
-		{
-			name: "GitHub Enterprise",
-			url: "ssh://git@ghe.example.com/acme/fork.git",
-			hosts: JSON.stringify({ hosts: { "ghe.example.com": [] } }),
-		},
-	];
-	for (const { name, url, hosts } of cases) {
+	for (const { url, githubHosts } of [
+		{ url: "git@github.com:acme/fork.git", githubHosts: [] },
+		{ url: "ssh://git@ghe.example.com/acme/fork.git", githubHosts: ["ghe.example.com"] },
+		{ url: "/srv/git/fork.git", githubHosts: [] },
+	]) {
 		const app = harness({
-			configResults: { "^remote\\..*\\.(url|pushurl)$": result(`remote.fork.url ${url}\n`) },
-			githubHostsResult: result(hosts),
+			githubHosts,
+			remoteListResult: result(`fork\t${url} (fetch)\norigin\tgit@gitea.example:acme/fork.git (push)\n`),
 		});
-		const discovery = await discoverCurrentPullRequest(app.pi, app.context);
-		assert.equal(discovery.kind, "current", name);
+		assert.equal((await discoverCurrentPullRequest(app.pi, app.context)).kind, "current", url);
 	}
 });
 
@@ -1185,9 +1181,7 @@ test("rediscovers an unpublished branch before link configuration or creation pr
 	const remoteReadIndexes = app.calls.flatMap(({ command, args }, index) =>
 		command === "git" && args[0] === "ls-remote" ? [index] : []
 	);
-	const firstConfigIndex = app.calls.findIndex(({ command, args }) =>
-		command === "git" && args[0] === "config" && args[1] === "--get-all"
-	);
+	const firstConfigIndex = app.calls.findIndex(({ command, args }) => command === "git" && args[0] === "config");
 	assert.equal(remoteReads, 2);
 	assert.equal(remoteReadIndexes.length, 2);
 	assert.ok(firstConfigIndex > remoteReadIndexes[1]!);

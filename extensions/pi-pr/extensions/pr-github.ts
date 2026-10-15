@@ -184,7 +184,7 @@ type TargetReadResult =
 	| { kind: "target"; target: PushTarget }
 	| { kind: "missing"; branch: string; remoteNames: string[] }
 	| { kind: "blocked"; issue: "detached" | "target" }
-	| { kind: "inactive" };
+	| { kind: "inactive"; nonGitHubHosts?: string[] };
 
 type LinkConfiguration = {
 	upstreamRemote: string[];
@@ -1394,6 +1394,8 @@ async function readPushTarget(
 	if (worktree.code === 0 && worktreeOutput === "false\n") return { kind: "inactive" };
 	if (worktree.code !== 0) commandFailure("Check Git worktree", worktree);
 	if (worktreeOutput !== "true\n") fail("Check Git worktree", "invalid response");
+	const nonGitHubHosts = await readNonGitHubRemoteHosts(pi, context);
+	if (nonGitHubHosts) return { kind: "inactive", nonGitHubHosts };
 
 	const branchResult = context.rebaseBranch === undefined
 		? await execute(pi, context, "Read current branch", "git", ["branch", "--show-current"])
@@ -1773,45 +1775,45 @@ export async function loadCurrentPullRequest(
 	inspectedLocal?: LocalMergeSafety,
 	observed?: unknown,
 ): Promise<CurrentPullRequestDiscovery> {
-	// A repository whose remote is not GitHub-hosted has no pull request workflow; stay inactive instead of failing
-	if (await isNonGitHubRepository(pi, context)) return { kind: "inactive" };
 	return await loadCurrentPullRequestInternal(pi, context, inspectedLocal, observed);
 }
 
-// shortcut: only reliable while remote URLs contain no spaces; git quotes URLs with special characters, and those fall back to the previous failure path
-async function isNonGitHubRepository(
+// Returns the remote hosts when no remote points to github.com or to a host that gh has credentials for.
+async function readNonGitHubRemoteHosts(
 	pi: Pick<ExtensionAPI, "exec">,
 	context: PullRequestLoadContext,
-): Promise<boolean> {
-	const result = await invoke(pi, context, "Read remote URLs", "git", [
-		"config", "--get-regexp", "^remote\\..*\\.(url|pushurl)$",
-	]);
-	if (result.code !== 0) return false;
-	const hosts: string[] = [];
+): Promise<string[] | null> {
+	// Unlike git config, git remote -v applies url.<base>.insteadOf and pushInsteadOf.
+	const result = await invoke(pi, context, "Read remote URLs", "git", ["remote", "-v"]);
+	if (result.code !== 0) return null;
+	const hosts = new Set<string>();
 	for (const line of result.stdout.replace(/\r\n/g, "\n").split("\n")) {
-		const separator = line.indexOf(" ");
-		if (separator === -1) continue;
-		const value = line.slice(separator + 1);
-		let host = "";
+		const url = /^[^\t]+\t(.*) \((?:fetch|push)\)$/.exec(line)?.[1];
+		if (url === undefined) continue;
+		const host = remoteHost(url);
+		// Keep the normal discovery path for remote forms without a host, such as local paths.
+		if (!host) return null;
+		hosts.add(host);
+	}
+	if (hosts.size === 0 || hosts.has("github.com")) return null;
+	for (const host of hosts) {
+		// gh auth token reads local credentials, including GH_ENTERPRISE_TOKEN, without a network request.
+		const token = await invoke(pi, context, "Read GitHub host credentials", "gh", ["auth", "token", "--hostname", host]);
+		if (token.code === 0) return null;
+	}
+	return [...hosts].sort();
+}
+
+function remoteHost(url: string): string | undefined {
+	if (url.includes("://")) {
 		try {
-			host = new URL(value).hostname;
+			return new URL(url).hostname.toLowerCase() || undefined;
 		} catch {
-			// scp syntax (git@host:owner/repo.git) is not a valid URL
-			host = /^(?:[^@/]+@)?([^:/]+):/.exec(value)?.[1] ?? "";
+			return undefined;
 		}
-		if (host) hosts.push(host.toLowerCase());
 	}
-	if (hosts.length === 0 || hosts.includes("github.com")) return false;
-	// any other host must be one gh knows about, such as a GitHub Enterprise host
-	const known = await invoke(pi, context, "Read GitHub hosts", "gh", ["auth", "status", "--json", "hosts"]);
-	if (known.code !== 0) return true;
-	try {
-		const parsed: unknown = JSON.parse(known.stdout.replace(/\r\n/g, "\n"));
-		const configured = Object.keys(isRecord(parsed) && isRecord(parsed.hosts) ? parsed.hosts : {});
-		return !hosts.some((host) => configured.includes(host));
-	} catch {
-		return true;
-	}
+	// scp-like syntax (git@host:owner/repo.git) needs a colon before the first slash.
+	return /^(?:[^@/]+@)?([^:/]+):/.exec(url)?.[1]?.toLowerCase();
 }
 
 async function loadCurrentPullRequestInternal(
@@ -1822,7 +1824,7 @@ async function loadCurrentPullRequestInternal(
 	creationIdentity?: CreationIdentity,
 ): Promise<CurrentPullRequestDiscovery> {
 	const read = await readPushTarget(pi, context);
-	if (read.kind === "inactive") return { kind: "inactive" };
+	if (read.kind === "inactive") return read;
 	if (read.kind === "blocked") {
 		return { kind: "blocked", issue: { kind: read.issue === "detached" ? "detached-head" : "target-invalid" } };
 	}
